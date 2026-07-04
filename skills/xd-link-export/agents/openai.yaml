@@ -1,0 +1,4 @@
+interface:
+  display_name: "XD Link Export"
+  short_description: "Export page bundles from XD share links"
+  default_prompt: "Use $xd-link-export to export a page bundle with screenshots and metadata from an Adobe XD share link."
