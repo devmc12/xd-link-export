@@ -42,6 +42,7 @@
 └── skills/
     └── xd-link-export/
         ├── SKILL.md                                     # Skill 入口说明
+        ├── requirements.txt                             # Python 依赖声明
         ├── agents/
         │   └── openai.yaml                              # Skill UI metadata
         ├── references/
@@ -64,6 +65,23 @@
 ```
 
 把 `skills/xd-link-export/` 复制或软链接到这个位置即可。
+
+## 依赖
+
+- Python 依赖声明在 `skills/xd-link-export/requirements.txt` 里
+- 如果缺少 `playwright` 或 `Pillow`，执行：
+
+```powershell
+cd skills/xd-link-export
+pip install -r requirements.txt
+```
+
+- 如果宿主机已经安装 Chrome，脚本会直接使用它
+- 如果没有 Chrome，请安装 Playwright 自带的 Chromium：
+
+```powershell
+python -m playwright install chromium
+```
 
 ## 运行
 

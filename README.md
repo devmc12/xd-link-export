@@ -42,6 +42,7 @@ It is mainly built for design-share-link-to-frontend, design analysis, and autom
 └── skills/
     └── xd-link-export/
         ├── SKILL.md                                     # Skill entry instructions
+        ├── requirements.txt                             # Python dependencies for the exporter
         ├── agents/
         │   └── openai.yaml                              # Skill UI metadata
         ├── references/
@@ -64,6 +65,23 @@ To use it inside a repository:
 ```
 
 Copy or symlink `skills/xd-link-export/` into that location.
+
+## Dependencies
+
+- Python packages are declared in `skills/xd-link-export/requirements.txt`
+- If `playwright` or `Pillow` is missing, run:
+
+```powershell
+cd skills/xd-link-export
+pip install -r requirements.txt
+```
+
+- If the host machine already has Chrome, no extra browser download is required
+- If Chrome is unavailable, install Playwright's bundled Chromium:
+
+```powershell
+python -m playwright install chromium
+```
 
 ## Run
 

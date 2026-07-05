@@ -24,7 +24,11 @@ def parse_args() -> argparse.Namespace:
     # Parse command-line options for the XD exporter.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="Adobe XD share/specs URL")
-    parser.add_argument("--output-root", default=".xd-export", help="Root export folder. Defaults to .xd-export in the current project")
+    parser.add_argument(
+        "--output-root",
+        default=".xd-export",
+        help="Root export folder. Defaults to .xd-export in the current project",
+    )
     parser.add_argument("--browser-width", type=int, default=2200, help="Browser viewport width")
     parser.add_argument("--browser-height", type=int, default=2800, help="Browser viewport height")
     parser.add_argument("--wait-ms", type=int, default=12000, help="Initial wait after navigation")
@@ -79,6 +83,22 @@ def build_screen_url(view_base_url: str, screen_id: str) -> str:
 def build_screen_specs_url(view_base_url: str, screen_id: str) -> str:
     # Build the canonical specs route for a screen id.
     return build_screen_url(view_base_url, screen_id) + "specs/"
+
+
+def launch_export_browser(playwright: Any):
+    # Launch Chrome when available and fall back to bundled Chromium.
+    try:
+        return playwright.chromium.launch(channel="chrome", headless=True)
+    except Exception:
+        pass
+
+    try:
+        return playwright.chromium.launch(headless=True)
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to launch a browser for XD export. "
+            "Install Google Chrome or run 'python -m playwright install chromium' first."
+        ) from exc
 
 
 def extract_inline_json_assignment(html_text: str, assignment_name: str) -> Any:
@@ -170,7 +190,9 @@ def resolve_target_screen_id(
     if requested_screen_id:
         if any(artboard.get("id") == requested_screen_id for artboard in artboards):
             return requested_screen_id
-        raise RuntimeError(f"Unable to find screen id {requested_screen_id} in window.prototypeData manifest artboards.")
+        raise RuntimeError(
+            f"Unable to find screen id {requested_screen_id} in window.prototypeData manifest artboards."
+        )
 
     first_screen_id = artboards[0].get("id")
     if not first_screen_id:
@@ -319,7 +341,7 @@ def main() -> int:
     exported_at = datetime.now().isoformat(timespec="seconds")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(channel="chrome", headless=True)
+        browser = launch_export_browser(p)
         page = browser.new_page(viewport={"width": args.browser_width, "height": args.browser_height})
         response = page.goto(input_url, wait_until="load", timeout=90000)
         if response is None:
@@ -345,8 +367,20 @@ def main() -> int:
         matched_index = next(index for index, artboard in enumerate(artboards) if artboard.get("id") == screen_id)
 
         artboard = artboards[matched_index]
-        project_title = manifest.get("name") or extract_meta_content(html_text, "property", "og:title") or extract_meta_content(html_text, "name", "twitter:title") or extract_document_title(html_text) or "xd-project"
-        screen_title = artboard.get("name") or extract_meta_content(html_text, "property", "og:title") or extract_meta_content(html_text, "name", "twitter:title") or extract_document_title(html_text) or "xd-screen"
+        project_title = (
+            manifest.get("name")
+            or extract_meta_content(html_text, "property", "og:title")
+            or extract_meta_content(html_text, "name", "twitter:title")
+            or extract_document_title(html_text)
+            or "xd-project"
+        )
+        screen_title = (
+            artboard.get("name")
+            or extract_meta_content(html_text, "property", "og:title")
+            or extract_meta_content(html_text, "name", "twitter:title")
+            or extract_document_title(html_text)
+            or "xd-screen"
+        )
         modified_date = prototype_data.get("modifiedDate")
         version_tag = version_tag_from_modified_date(modified_date)
         screen_index = matched_index + 1

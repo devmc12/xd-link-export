@@ -7,6 +7,22 @@ description: Export a reusable page bundle from Adobe XD share links, especially
 
 Use this skill to turn an Adobe XD web share/specs link into reusable local artifacts for later frontend work.
 
+## Dependencies
+
+- Python packages are declared in `requirements.txt`
+- If `playwright` or `Pillow` is missing, run:
+
+```powershell
+pip install -r requirements.txt
+```
+
+- If the host machine already has Chrome, the exporter uses it directly
+- If Chrome is unavailable, install Playwright's bundled Chromium:
+
+```powershell
+python -m playwright install chromium
+```
+
 ## Quick Start
 
 Run the exporter first:
@@ -56,11 +72,12 @@ The bundle contains:
 3. Read `window.prototypeData` directly from the HTML response instead of parsing visible browser labels.
 4. Use the top-level `modifiedDate` and the artboards array inside `window.prototypeData` to resolve version tag, page index, page count, titles, and design dimensions.
 5. Group exports under a normalized version folder such as `Sample Project - v07040010`.
-6. If the input route is not already `screen/.../specs/`, resolve the target page first and then capture from its canonical specs route.
-7. Capture the render canvas from the browser surface in memory and lock the crop height to the XD design ratio.
-8. Export normalized `1x` and `2x` artboard images directly into the page folder root.
-9. Write a single `metadata.json` file that combines page source fields and capture details.
-10. Update `pages.json` so each screen keeps its latest export directory and a history of repeated exports.
+6. Launch the browser with a preference for the host Chrome installation and fall back to Playwright's bundled Chromium when Chrome is unavailable.
+7. If the input route is not already `screen/.../specs/`, resolve the target page first and then capture from its canonical specs route.
+8. Capture the render canvas from the browser surface in memory and lock the crop height to the XD design ratio.
+9. Export normalized `1x` and `2x` artboard images directly into the page folder root.
+10. Write a single `metadata.json` file that combines page source fields and capture details.
+11. Update `pages.json` so each screen keeps its latest export directory and a history of repeated exports.
 
 ## Read These References When Needed
 
