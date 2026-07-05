@@ -18,8 +18,8 @@
 ### 截图导出
 
 - 去掉 viewer chrome 和外部空白边缘
-- 导出标准化的 `artboard-1x.png` 和 `artboard-2x.png`
-- 通过大视口和比例锁定裁切，稳定导出长页面
+- 导出原生 `artboard-1x.png` 和 `artboard-2x.png`
+- 通过 XD specs zoom 和 SVG 画板 rect 几何，稳定导出长页面
 
 ### Metadata 导出
 
@@ -49,9 +49,8 @@
         │   ├── capture-rules.md                         # 截图规则和 metadata 来源说明
         │   └── output-layout.md                         # 导出目录和文件布局说明
         └── scripts/
-            ├── export_xd_page_bundle.py                 # 主导出脚本
-            └── capture/
-                └── crop_xd_artboard.py                  # 画板裁切和标准化图片导出
+            ├── export_xd_page_bundle.py                 # Metadata 和页面 bundle 编排入口
+            └── capture_xd_artboard.py                   # 原生画板截图脚本
 ```
 
 ## 安装
@@ -69,7 +68,7 @@
 ## 依赖
 
 - Python 依赖声明在 `skills/xd-link-export/requirements.txt` 里
-- 如果缺少 `playwright` 或 `Pillow`，执行：
+- 如果缺少 `playwright`，执行：
 
 ```powershell
 cd skills/xd-link-export

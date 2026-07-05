@@ -1,6 +1,6 @@
 ---
 name: xd-link-export
-description: Export a reusable page bundle from Adobe XD share links, especially `xd.adobe.com/view/SHARE_ID/screen/SCREEN_ID/`, `.../screen/SCREEN_ID/specs/`, `.../screen/SCREEN_ID/variables/`, and `.../grid` routes. Use when Codex needs to capture clean 1x and 2x artboard images, collect page-level source and capture metadata, remove viewer chrome and outer blank areas, preserve long mobile screens by using a large browser viewport, and write the results under `.xd-export/` inside the current project.
+description: Export a reusable page bundle from Adobe XD share links, especially `xd.adobe.com/view/SHARE_ID/screen/SCREEN_ID/`, `.../screen/SCREEN_ID/specs/`, `.../screen/SCREEN_ID/variables/`, and `.../grid` routes. Use when Codex needs to capture clean native 1x and 2x artboard images through XD specs zoom, collect page-level source and capture metadata, remove viewer chrome and outer blank areas, preserve long mobile screens, and write the results under `.xd-export/` inside the current project.
 ---
 
 # XD Link Export
@@ -10,7 +10,7 @@ Use this skill to turn an Adobe XD web share/specs link into reusable local arti
 ## Dependencies
 
 - Python packages are declared in `requirements.txt`
-- If `playwright` or `Pillow` is missing, run:
+- If `playwright` is missing, run:
 
 ```powershell
 pip install -r requirements.txt
@@ -68,16 +68,18 @@ The bundle contains:
 ## Workflow
 
 1. Accept any XD `view/...` route that exposes `window.prototypeData`, but prefer a direct `screen/.../specs/` URL whenever possible.
-2. Open the link with a large browser viewport so tall mobile designs can fit without losing the bottom.
-3. Read `window.prototypeData` directly from the HTML response instead of parsing visible browser labels.
+2. Open the input route first and read `window.prototypeData` directly from the HTML response instead of parsing visible browser labels.
+3. Resolve the canonical specs URL and artboard design size from that metadata.
 4. Use the top-level `modifiedDate` and the artboards array inside `window.prototypeData` to resolve version tag, page index, page count, titles, and design dimensions.
 5. Group exports under a normalized version folder such as `Sample Project - v07040010`.
 6. Launch the browser with a preference for the host Chrome installation and fall back to Playwright's bundled Chromium when Chrome is unavailable.
 7. If the input route is not already `screen/.../specs/`, resolve the target page first and then capture from its canonical specs route.
-8. Capture the render canvas from the browser surface in memory and lock the crop height to the XD design ratio.
-9. Export normalized `1x` and `2x` artboard images directly into the page folder root.
-10. Write a single `metadata.json` file that combines page source fields and capture details.
-11. Update `pages.json` so each screen keeps its latest export directory and a history of repeated exports.
+8. Use `scripts/capture_xd_artboard.py` for screenshot capture, not metadata extraction.
+9. Set XD's own specs zoom to `100` for `1x` and `200` for `2x`.
+10. Read the artboard boundary from `[data-auto="svgContainer"] svg rect`, verify the canvas backing pixels are large enough for the requested scale, and capture the rect directly from the browser surface.
+11. Export native `1x` and `2x` artboard images directly into the page folder root.
+12. Write a single `metadata.json` file that combines page source fields and capture details.
+13. Update `pages.json` so each screen keeps its latest export directory and a history of repeated exports.
 
 ## Read These References When Needed
 
@@ -87,8 +89,8 @@ The bundle contains:
 ## Notes
 
 - Direct `canvas.toDataURL()` is not trustworthy for XD viewer captures; XD uses a WebGL render path and the result can be a black frame.
-- Prefer browser-surface clipped capture of the canvas element.
+- Prefer browser-surface clipped capture of XD's artboard overlay rect.
 - Keep exported artifacts in the project-local `.xd-export/` folder unless the user explicitly requests another location.
 - Keep only the final `1x` and `2x` images by default; do not persist intermediate screenshots unless the skill is explicitly being debugged.
 - Do not rely on localized UI labels such as "Link updated", "Viewport size", or "Design size" for metadata extraction.
-- Treat the current skill scope as capture-only; add future resource, text, and element workflows as separate capabilities rather than overloading the capture entrypoint.
+- Keep `scripts/export_xd_page_bundle.py` as the metadata and bundle orchestration entrypoint; add resource, text, and element extraction as separate scripts that consume the same XD metadata.

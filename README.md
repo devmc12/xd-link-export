@@ -18,8 +18,8 @@ It is mainly built for design-share-link-to-frontend, design analysis, and autom
 ### Screenshot export
 
 - remove viewer chrome and outer blank margins
-- export normalized `artboard-1x.png` and `artboard-2x.png`
-- keep long-page capture stable with a large browser viewport and ratio-locked crop
+- export native `artboard-1x.png` and `artboard-2x.png`
+- use XD specs zoom plus SVG artboard rect geometry for stable long-page capture
 
 ### Metadata export
 
@@ -49,9 +49,8 @@ It is mainly built for design-share-link-to-frontend, design analysis, and autom
         │   ├── capture-rules.md                         # Capture rules and metadata source notes
         │   └── output-layout.md                         # Export folder and file layout
         └── scripts/
-            ├── export_xd_page_bundle.py                 # Main XD page export script
-            └── capture/
-                └── crop_xd_artboard.py                  # Artboard crop detection and normalized image export
+            ├── export_xd_page_bundle.py                 # Metadata and page-bundle orchestration
+            └── capture_xd_artboard.py                   # Native artboard screenshot capture
 ```
 
 ## Install
@@ -69,7 +68,7 @@ Copy or symlink `skills/xd-link-export/` into that location.
 ## Dependencies
 
 - Python packages are declared in `skills/xd-link-export/requirements.txt`
-- If `playwright` or `Pillow` is missing, run:
+- If `playwright` is missing, run:
 
 ```powershell
 cd skills/xd-link-export

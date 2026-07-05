@@ -65,6 +65,11 @@ Recommended downstream consumption:
 
 File roles:
 
-- `metadata.json`: merged page source plus capture details, including canonical screen URL, project title, screen title, screen index, viewport size, design size, browser viewport, canvas bounds, crop box, output directory, and emitted file paths
+- `metadata.json`: merged page source plus capture details, including canonical screen URL, project title, screen title, screen index, viewport size, design size, XD zoom scale, selected SVG artboard rect, canvas bounds, projected raw size, output directory, and emitted file paths
 - `xd-metadata.json`: raw `window.prototypeData` object extracted from the HTML response for the current XD share version
 - `pages.json`: project-level page index. The `project.url` field points to the XD grid route. Each page entry stores its canonical screen URL, source fields, the latest exported page directory, and an `exports` history of directories so repeated exports of the same screen are preserved without duplicating per-file paths
+
+Script roles:
+
+- `scripts/export_xd_page_bundle.py`: metadata and page-bundle orchestration entrypoint
+- `scripts/capture_xd_artboard.py`: native artboard screenshot capture using XD zoom and SVG rect geometry

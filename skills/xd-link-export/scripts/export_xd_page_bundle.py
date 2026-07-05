@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""Export a page bundle and metadata from an Adobe XD screen/specs link."""
+"""Export Adobe XD page metadata and a page bundle from a share link."""
 
 from __future__ import annotations
 
 import argparse
-import base64
 import html
 import json
 import os
 import re
 from datetime import datetime
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+from capture_xd_artboard import capture_artboard_scales, launch_capture_browser, parse_scale_list
 from playwright.sync_api import sync_playwright
-
-from capture.crop_xd_artboard import detect_bbox
-from PIL import Image
 
 
 def parse_args() -> argparse.Namespace:
-    # Parse command-line options for the XD exporter.
+    # Parse command-line options for the XD page bundle exporter.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", required=True, help="Adobe XD share/specs URL")
     parser.add_argument(
@@ -29,10 +25,11 @@ def parse_args() -> argparse.Namespace:
         default=".xd-export",
         help="Root export folder. Defaults to .xd-export in the current project",
     )
-    parser.add_argument("--browser-width", type=int, default=2200, help="Browser viewport width")
-    parser.add_argument("--browser-height", type=int, default=2800, help="Browser viewport height")
+    parser.add_argument("--browser-width", type=int, default=1600, help="Initial metadata viewport width")
+    parser.add_argument("--browser-height", type=int, default=1200, help="Initial metadata viewport height")
     parser.add_argument("--wait-ms", type=int, default=12000, help="Initial wait after navigation")
-    parser.add_argument("--capture-scales", default="1,2", help="Comma-separated normalized output scales")
+    parser.add_argument("--post-zoom-wait-ms", type=int, default=1000, help="Wait after changing XD zoom")
+    parser.add_argument("--capture-scales", default="1,2", help="Comma-separated native output scales")
     return parser.parse_args()
 
 
@@ -83,22 +80,6 @@ def build_screen_url(view_base_url: str, screen_id: str) -> str:
 def build_screen_specs_url(view_base_url: str, screen_id: str) -> str:
     # Build the canonical specs route for a screen id.
     return build_screen_url(view_base_url, screen_id) + "specs/"
-
-
-def launch_export_browser(playwright: Any):
-    # Launch Chrome when available and fall back to bundled Chromium.
-    try:
-        return playwright.chromium.launch(channel="chrome", headless=True)
-    except Exception:
-        pass
-
-    try:
-        return playwright.chromium.launch(headless=True)
-    except Exception as exc:
-        raise RuntimeError(
-            "Unable to launch a browser for XD export. "
-            "Install Google Chrome or run 'python -m playwright install chromium' first."
-        ) from exc
 
 
 def extract_inline_json_assignment(html_text: str, assignment_name: str) -> Any:
@@ -166,17 +147,6 @@ def version_tag_from_modified_date(modified_date_ms: int | None) -> str | None:
         return None
     dt = datetime.fromtimestamp(modified_date_ms / 1000)
     return f"v{dt.month:02d}{dt.day:02d}{dt.hour:02d}{dt.minute:02d}"
-
-
-def parse_scale_list(text: str) -> list[int]:
-    # Parse normalized export scales from a comma-separated string.
-    values = []
-    for chunk in text.split(","):
-        chunk = chunk.strip()
-        if not chunk:
-            continue
-        values.append(int(chunk))
-    return values or [1, 2]
 
 
 def resolve_target_screen_id(
@@ -272,10 +242,10 @@ def update_pages_index(
             existing = {}
 
     existing_pages = {}
-    for page in existing.get("pages", []):
-        screen_id = page.get("screenId")
+    for page_entry in existing.get("pages", []):
+        screen_id = page_entry.get("screenId")
         if screen_id:
-            existing_pages[screen_id] = page
+            existing_pages[screen_id] = page_entry
 
     manifest = prototype_data.get("manifest", {})
     artboards = manifest.get("artboards", [])
@@ -332,8 +302,22 @@ def update_pages_index(
     pages_index_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def read_xd_metadata(page: Any, input_url: str, wait_ms: int) -> dict[str, Any]:
+    # Read the XD HTML response, inline prototype data, and resolved route.
+    response = page.goto(input_url, wait_until="load", timeout=90000)
+    if response is None:
+        raise RuntimeError("Unable to read the initial XD HTML response.")
+    html_text = response.text()
+    page.wait_for_timeout(wait_ms)
+    return {
+        "htmlText": html_text,
+        "resolvedUrl": page.url,
+        "prototypeData": extract_inline_json_assignment(html_text, "window.prototypeData"),
+    }
+
+
 def main() -> int:
-    # Run the full XD export workflow from input URL to output files.
+    # Run the metadata-first XD export workflow from input URL to output files.
     args = parse_args()
     output_root = Path(args.output_root)
     root_dir = Path.cwd()
@@ -341,131 +325,81 @@ def main() -> int:
     exported_at = datetime.now().isoformat(timespec="seconds")
 
     with sync_playwright() as p:
-        browser = launch_export_browser(p)
-        page = browser.new_page(viewport={"width": args.browser_width, "height": args.browser_height})
-        response = page.goto(input_url, wait_until="load", timeout=90000)
-        if response is None:
-            raise RuntimeError("Unable to read the initial XD HTML response.")
-        html_text = response.text()
-        page.wait_for_timeout(args.wait_ms)
-        input_resolved_url = page.url
-        prototype_data = extract_inline_json_assignment(html_text, "window.prototypeData")
-        view_base_url = extract_view_base_url(input_resolved_url) or extract_view_base_url(input_url)
-        if not view_base_url:
-            raise RuntimeError("Unable to resolve XD view base URL.")
+        browser = launch_capture_browser(p)
+        try:
+            page = browser.new_page(viewport={"width": args.browser_width, "height": args.browser_height})
+            try:
+                metadata_source = read_xd_metadata(page, input_url, args.wait_ms)
+            finally:
+                page.close()
 
-        manifest = prototype_data.get("manifest", {})
-        artboards = manifest.get("artboards", [])
-        screen_count = len(artboards)
-        requested_screen_id = extract_screen_id(input_resolved_url) or extract_screen_id(input_url)
-        screen_id = resolve_target_screen_id(artboards, requested_screen_id)
-        capture_url = build_screen_specs_url(view_base_url, screen_id)
-        if page.url.rstrip("/") != capture_url.rstrip("/"):
-            page.goto(capture_url, wait_until="load", timeout=90000)
-            page.wait_for_timeout(args.wait_ms)
+            html_text = metadata_source["htmlText"]
+            input_resolved_url = metadata_source["resolvedUrl"]
+            prototype_data = metadata_source["prototypeData"]
+            view_base_url = extract_view_base_url(input_resolved_url) or extract_view_base_url(input_url)
+            if not view_base_url:
+                raise RuntimeError("Unable to resolve XD view base URL.")
 
-        matched_index = next(index for index, artboard in enumerate(artboards) if artboard.get("id") == screen_id)
+            manifest = prototype_data.get("manifest", {})
+            artboards = manifest.get("artboards", [])
+            screen_count = len(artboards)
+            requested_screen_id = extract_screen_id(input_resolved_url) or extract_screen_id(input_url)
+            screen_id = resolve_target_screen_id(artboards, requested_screen_id)
+            capture_url = build_screen_specs_url(view_base_url, screen_id)
+            matched_index = next(index for index, artboard in enumerate(artboards) if artboard.get("id") == screen_id)
 
-        artboard = artboards[matched_index]
-        project_title = (
-            manifest.get("name")
-            or extract_meta_content(html_text, "property", "og:title")
-            or extract_meta_content(html_text, "name", "twitter:title")
-            or extract_document_title(html_text)
-            or "xd-project"
-        )
-        screen_title = (
-            artboard.get("name")
-            or extract_meta_content(html_text, "property", "og:title")
-            or extract_meta_content(html_text, "name", "twitter:title")
-            or extract_document_title(html_text)
-            or "xd-screen"
-        )
-        modified_date = prototype_data.get("modifiedDate")
-        version_tag = version_tag_from_modified_date(modified_date)
-        screen_index = matched_index + 1
-        current_page_source = build_page_source_entry(artboard, screen_index, view_base_url)
-        design_width = current_page_source["designWidth"]
-        design_height = current_page_source["designHeight"]
-        viewport_width = current_page_source["viewportWidth"]
-        viewport_height = current_page_source["viewportHeight"]
-        screen_url = current_page_source["url"]
+            artboard = artboards[matched_index]
+            project_title = (
+                manifest.get("name")
+                or extract_meta_content(html_text, "property", "og:title")
+                or extract_meta_content(html_text, "name", "twitter:title")
+                or extract_document_title(html_text)
+                or "xd-project"
+            )
+            screen_title = (
+                artboard.get("name")
+                or extract_meta_content(html_text, "property", "og:title")
+                or extract_meta_content(html_text, "name", "twitter:title")
+                or extract_document_title(html_text)
+                or "xd-screen"
+            )
+            modified_date = prototype_data.get("modifiedDate")
+            version_tag = version_tag_from_modified_date(modified_date)
+            screen_index = matched_index + 1
+            current_page_source = build_page_source_entry(artboard, screen_index, view_base_url)
+            design_width = current_page_source["designWidth"]
+            design_height = current_page_source["designHeight"]
+            viewport_width = current_page_source["viewportWidth"]
+            viewport_height = current_page_source["viewportHeight"]
+            screen_url = current_page_source["url"]
 
-        version_dir = build_version_dir(output_root, project_title, version_tag)
-        version_dir.mkdir(parents=True, exist_ok=True)
-        xd_metadata_path = version_dir / "xd-metadata.json"
-        xd_metadata_path.write_text(
-            json.dumps(prototype_data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+            version_dir = build_version_dir(output_root, project_title, version_tag)
+            version_dir.mkdir(parents=True, exist_ok=True)
+            xd_metadata_path = version_dir / "xd-metadata.json"
+            xd_metadata_path.write_text(
+                json.dumps(prototype_data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
 
-        run_dir = build_run_dir(version_dir, screen_title, screen_index)
-        run_dir.mkdir(parents=True, exist_ok=True)
+            run_dir = build_run_dir(version_dir, screen_title, screen_index)
+            run_dir.mkdir(parents=True, exist_ok=True)
 
-        canvas = page.locator("canvas").first
-        if not canvas.count():
-            raise RuntimeError("XD viewer canvas was not found.")
-
-        rect = canvas.bounding_box()
-        if not rect:
-            raise RuntimeError("Unable to resolve XD viewer canvas bounds.")
-        dims = page.evaluate(
-            """
-            () => {
-              const c = document.querySelector('canvas');
-              const r = c.getBoundingClientRect();
-              return { width: c.width, height: c.height, cssWidth: r.width, cssHeight: r.height };
-            }
-            """
-        )
-        scale = dims["width"] / max(dims["cssWidth"], 1)
-        cdp = page.context.new_cdp_session(page)
-        shot = cdp.send(
-            "Page.captureScreenshot",
-            {
-                "format": "png",
-                "clip": {
-                    "x": rect["x"],
-                    "y": rect["y"],
-                    "width": rect["width"],
-                    "height": rect["height"],
-                    "scale": scale,
-                },
-                "captureBeyondViewport": True,
-                "fromSurface": True,
-            },
-        )
-        canvas_png_bytes = base64.b64decode(shot["data"])
-
-        browser.close()
-
-    image = Image.open(BytesIO(canvas_png_bytes)).convert("RGB")
-    left, top, right, bottom = detect_bbox(
-        image=image,
-        threshold=248,
-        min_row_coverage=0.03,
-        lock_design_ratio=True,
-        design_width=design_width,
-        design_height=design_height,
-        min_leading_span=20,
-    )
-    cropped = image.crop((left, top, right + 1, bottom + 1))
-
-    scale_outputs: dict[str, str] = {}
-    for scale_value in parse_scale_list(args.capture_scales):
-        target = (
-            design_width * scale_value,
-            design_height * scale_value,
-        )
-        resized = cropped.resize(target, resample=Image.Resampling.LANCZOS)
-        output_name = "artboard-1x.png" if scale_value == 1 else f"artboard-{scale_value}x.png"
-        output_path = run_dir / output_name
-        resized.save(output_path)
-        scale_outputs[f"{scale_value}x"] = str(output_path)
+            capture_result = capture_artboard_scales(
+                browser=browser,
+                capture_url=capture_url,
+                output_dir=run_dir,
+                design_width=design_width,
+                design_height=design_height,
+                scale_values=parse_scale_list(args.capture_scales),
+                wait_ms=args.wait_ms,
+                post_zoom_wait_ms=args.post_zoom_wait_ms,
+            )
+        finally:
+            browser.close()
 
     scale_outputs_rel = {
         key: relative_path_str(Path(path), root_dir)
-        for key, path in scale_outputs.items()
+        for key, path in capture_result["files"].items()
     }
     metadata = {
         "source": {
@@ -482,16 +416,8 @@ def main() -> int:
             "designHeight": design_height,
         },
         "capture": {
-            "browserViewport": {"width": args.browser_width, "height": args.browser_height},
-            "canvas": {"rect": rect, "dims": dims, "captureScale": scale},
-            "crop": {
-                "left": left,
-                "top": top,
-                "right": right,
-                "bottom": bottom,
-                "width": cropped.width,
-                "height": cropped.height,
-            },
+            "strategy": capture_result["strategy"],
+            "scales": capture_result["scales"],
         },
         "outputs": {
             "versionDirectory": relative_path_str(version_dir, root_dir),

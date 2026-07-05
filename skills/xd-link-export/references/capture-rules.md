@@ -29,25 +29,39 @@ Use the current page index as the output folder prefix:
 
 Convert the top-level `window.prototypeData.modifiedDate` into a stable `vMMDDHHMM` tag. If the page folder already exists inside the same version folder, append a timestamp suffix instead of overwriting the earlier export.
 
-## Why Large Browser Viewports Matter
+## Why Specs Zoom Matters
 
 Long mobile designs often have:
 
 - a viewport size such as `750 x 1526`
 - a larger design size such as `750 x 2007`
 
-If the browser viewport is too small, XD still renders the screen but the visible design area may not contain the full height. Use a large browser viewport so the entire long design can fit in specs mode.
+Use XD's own specs zoom control as the scale source:
+
+- write `100` into `[data-auto="zoomInputBox"]` for `1x`
+- write `200` into `[data-auto="zoomInputBox"]` for `2x`
+
+Then wait until `[data-auto="svgContainer"] svg rect` has the expected CSS width:
+
+- `designWidth` at `1x`
+- `designWidth * 2` at `2x`
+
+The browser viewport should be large enough for the requested zoom, but not blindly maximized. Very large viewports can reduce the canvas backing-pixel ratio and lower capture fidelity.
+
+The capture implementation lives in `scripts/capture_xd_artboard.py`. The page bundle entrypoint should call it after metadata has resolved the canonical specs URL and artboard design size.
 
 ## Why Direct JS Canvas Export Fails
 
 The XD viewer render surface is commonly a WebGL canvas. Calling `canvas.toDataURL()` may return a black image. The reliable path is:
 
 1. locate the visible canvas element
-2. read its CSS bounding box
-3. read its intrinsic `canvas.width` and `canvas.height`
-4. capture the canvas region from the browser surface at the matching scale
+2. read the artboard boundary from `[data-auto="svgContainer"] svg rect`
+3. verify the selected rect is fully inside the canvas bounds
+4. compare the projected canvas backing pixels against the requested output size
+5. hide the SVG overlay stroke
+6. capture the artboard rect from the browser surface
 
-Keep this canvas capture in memory unless the task is specifically debugging the viewer. The default export should retain only the final `1x` and `2x` artboard images, written directly into the page folder root.
+The default export should retain only the final `1x` and `2x` artboard images, written directly into the page folder root.
 
 ## Metadata Source
 
@@ -58,14 +72,17 @@ Prefer this source order:
 1. `window.prototypeData` embedded in the HTML response
 2. HTML meta tags such as `og:title` or `twitter:title` only as a fallback for missing titles
 
-## Ratio-Locked Crop
+## Native Scale Validation
 
-When the artboard has large pale areas, plain “non-white bounding box” detection can trim the bottom too early.
+Do not infer artboard bounds from pixel color. White, pale, or empty designs can make content-based bounding boxes trim the artboard incorrectly.
 
-Use this correction:
+For each requested scale, validate the raw source pixels before writing the final PNG:
 
-1. detect the artboard width inside the canvas
-2. read the XD design width and height from specs
-3. infer the full cropped height from the design ratio
+1. compute `targetWidth = designWidth * scale`
+2. compute `targetHeight = designHeight * scale`
+3. compute `scaleX = canvas.width / canvasCssWidth`
+4. compute `scaleY = canvas.height / canvasCssHeight`
+5. compute the selected rect's projected raw width and height
+6. require projected raw width and height to be at least the target output size
 
-This keeps the crop aligned with the intended XD artboard size.
+If this check fails, try another viewport. Do not resize an undersized capture and call it `2x`.
