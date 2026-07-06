@@ -7,6 +7,7 @@ import argparse
 import base64
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -20,9 +21,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True, help="Folder for artboard PNG outputs")
     parser.add_argument("--design-width", type=int, required=True, help="Artboard design width")
     parser.add_argument("--design-height", type=int, required=True, help="Artboard design height")
-    parser.add_argument("--wait-ms", type=int, default=12000, help="Initial wait after navigation")
-    parser.add_argument("--post-zoom-wait-ms", type=int, default=1000, help="Wait after changing XD zoom")
-    parser.add_argument("--capture-scales", default="1,2", help="Comma-separated native output scales")
+    parser.add_argument("--wait-ms", type=int, default=15000, help="Maximum wait for XD UI after navigation")
+    parser.add_argument("--post-zoom-wait-ms", type=int, default=200, help="Short settle wait after changing XD zoom")
+    parser.add_argument("--scales", default="1", help='Native output scales: "1", "2", "1,2", or "2,1"')
     parser.add_argument(
         "--metadata-file",
         help="Optional JSON file for standalone capture metadata",
@@ -32,13 +33,29 @@ def parse_args() -> argparse.Namespace:
 
 def parse_scale_list(text: str) -> list[int]:
     # Parse native export scales from a comma-separated string.
+    if text is None or not text.strip():
+        raise RuntimeError('--scales must be one of: "1", "2", "1,2", or "2,1".')
+
     values = []
     for chunk in text.split(","):
         chunk = chunk.strip()
         if not chunk:
-            continue
-        values.append(int(chunk))
-    return values or [1, 2]
+            raise RuntimeError('--scales must be one of: "1", "2", "1,2", or "2,1".')
+        if chunk not in {"1", "2"}:
+            raise RuntimeError('--scales only supports native scales 1 and 2.')
+        value = int(chunk)
+        if value not in values:
+            values.append(value)
+    return values
+
+
+def capture_order(scale_values: list[int]) -> list[int]:
+    # Capture larger native scales first because XD downgrades zoom state more reliably than it upgrades it.
+    unique_values = []
+    for value in scale_values:
+        if value not in unique_values:
+            unique_values.append(value)
+    return sorted(unique_values, reverse=True)
 
 
 def launch_capture_browser(playwright: Any) -> Any:
@@ -88,10 +105,23 @@ def build_candidate_viewports(design_width: int, design_height: int, scale_value
 
 def wait_for_capture_ui(page: Any, wait_ms: int) -> None:
     # Wait for the XD specs canvas, zoom input, and artboard overlay to exist.
-    page.wait_for_selector("canvas", state="visible", timeout=90000)
-    page.wait_for_selector('[data-auto="zoomInputBox"]', state="visible", timeout=90000)
-    page.wait_for_selector('[data-auto="svgContainer"]', state="attached", timeout=90000)
-    page.wait_for_timeout(wait_ms)
+    timeout_ms = max(wait_ms, 1000)
+    page.wait_for_selector("canvas", state="visible", timeout=timeout_ms)
+    page.wait_for_selector('[data-auto="zoomInputBox"]', state="visible", timeout=timeout_ms)
+    page.wait_for_selector('[data-auto="svgContainer"]', state="attached", timeout=timeout_ms)
+    page.wait_for_function(
+        """() => {
+          const canvas = Array.from(document.querySelectorAll("canvas")).find((node) => {
+            const rect = node.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0 && node.width > 0 && node.height > 0;
+          });
+          const rect = document.querySelector('[data-auto="svgContainer"] svg rect');
+          if (!canvas || !rect) return false;
+          const bounds = rect.getBoundingClientRect();
+          return bounds.width > 0 && bounds.height > 0;
+        }""",
+        timeout=timeout_ms,
+    )
 
 
 def set_xd_zoom(page: Any, scale_value: int, design_width: int, wait_ms: int) -> None:
@@ -311,26 +341,38 @@ def capture_artboard_png(page: Any, rect_candidate: dict[str, Any], target_width
         }
         """
     )
-    page.wait_for_timeout(100)
+    try:
+        page.wait_for_timeout(100)
 
-    rect = rect_candidate["rect"]
-    scale = target_width / max(rect["width"], 1)
-    cdp = page.context.new_cdp_session(page)
-    shot = cdp.send(
-        "Page.captureScreenshot",
-        {
-            "format": "png",
-            "clip": {
-                "x": rect["left"],
-                "y": rect["top"],
-                "width": rect["width"],
-                "height": rect["height"],
-                "scale": scale,
+        rect = rect_candidate["rect"]
+        scale = target_width / max(rect["width"], 1)
+        cdp = page.context.new_cdp_session(page)
+        shot = cdp.send(
+            "Page.captureScreenshot",
+            {
+                "format": "png",
+                "clip": {
+                    "x": rect["left"],
+                    "y": rect["top"],
+                    "width": rect["width"],
+                    "height": rect["height"],
+                    "scale": scale,
+                },
+                "captureBeyondViewport": True,
+                "fromSurface": True,
             },
-            "captureBeyondViewport": True,
-            "fromSurface": True,
-        },
-    )
+        )
+    finally:
+        page.evaluate(
+            """
+            () => {
+              document.querySelectorAll('[data-auto="svgContainer"]').forEach((node) => {
+                node.style.visibility = "";
+              });
+            }
+            """
+        )
+
     png_bytes = base64.b64decode(shot["data"])
     actual_width, actual_height = png_size(png_bytes)
     if (actual_width, actual_height) != (target_width, target_height):
@@ -341,27 +383,23 @@ def capture_artboard_png(page: Any, rect_candidate: dict[str, Any], target_width
     return png_bytes
 
 
-def capture_scale_output(
-    browser: Any,
-    capture_url: str,
+def capture_scale_on_page(
+    page: Any,
     output_path: Path,
     design_width: int,
     design_height: int,
     scale_value: int,
-    wait_ms: int,
     post_zoom_wait_ms: int,
 ) -> dict[str, Any]:
-    # Export one native-scale artboard PNG through XD zoom and overlay rect geometry.
+    # Export one native-scale artboard PNG on an already-loaded XD specs page.
     target_width = design_width * scale_value
     target_height = design_height * scale_value
     attempts: list[dict[str, Any]] = []
 
     for viewport in build_candidate_viewports(design_width, design_height, scale_value):
-        context = browser.new_context(viewport=viewport, device_scale_factor=1)
-        page = context.new_page()
         try:
-            page.goto(capture_url, wait_until="load", timeout=90000)
-            wait_for_capture_ui(page, wait_ms)
+            page.set_viewport_size(viewport)
+            page.wait_for_timeout(250)
             set_xd_zoom(page, scale_value, design_width, post_zoom_wait_ms)
             dom_geometry = collect_dom_geometry(page)
             canvas = choose_canvas(dom_geometry["canvases"])
@@ -414,11 +452,38 @@ def capture_scale_output(
                     "error": {"type": exc.__class__.__name__, "message": str(exc)},
                 }
             )
-        finally:
-            page.close()
-            context.close()
 
     raise RuntimeError(f"Unable to capture native {scale_value}x artboard after {len(attempts)} attempts.")
+
+
+def capture_scale_output(
+    browser: Any,
+    capture_url: str,
+    output_path: Path,
+    design_width: int,
+    design_height: int,
+    scale_value: int,
+    wait_ms: int,
+    post_zoom_wait_ms: int,
+) -> dict[str, Any]:
+    # Export one native-scale artboard PNG through XD zoom and overlay rect geometry.
+    initial_viewport = build_candidate_viewports(design_width, design_height, scale_value)[0]
+    context = browser.new_context(viewport=initial_viewport, device_scale_factor=1)
+    page = context.new_page()
+    try:
+        page.goto(capture_url, wait_until="domcontentloaded", timeout=max(wait_ms + 5000, 20000))
+        wait_for_capture_ui(page, wait_ms)
+        return capture_scale_on_page(
+            page=page,
+            output_path=output_path,
+            design_width=design_width,
+            design_height=design_height,
+            scale_value=scale_value,
+            post_zoom_wait_ms=post_zoom_wait_ms,
+        )
+    finally:
+        page.close()
+        context.close()
 
 
 def capture_artboard_scales(
@@ -431,12 +496,12 @@ def capture_artboard_scales(
     wait_ms: int,
     post_zoom_wait_ms: int,
 ) -> dict[str, Any]:
-    # Capture all requested native artboard scales into one output folder.
+    # Capture each requested native artboard scale in an isolated XD specs page.
     output_dir.mkdir(parents=True, exist_ok=True)
     files: dict[str, str] = {}
     scales: dict[str, Any] = {}
-
-    for scale_value in scale_values:
+    ordered_scales = capture_order(scale_values)
+    for scale_value in ordered_scales:
         scale_key = f"{scale_value}x"
         output_name = "artboard-1x.png" if scale_value == 1 else f"artboard-{scale_value}x.png"
         output_path = output_dir / output_name
@@ -463,7 +528,11 @@ def main() -> int:
     # Run standalone native artboard capture.
     args = parse_args()
     output_dir = Path(args.output_dir)
-    scale_values = parse_scale_list(args.capture_scales)
+    try:
+        scale_values = parse_scale_list(args.scales)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
 
     with sync_playwright() as p:
         browser = launch_capture_browser(p)

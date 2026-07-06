@@ -34,7 +34,7 @@ Example:
 .xd-export/Sample Project - v07040010/07-Sample-Mobile-Account-Screen/
 ```
 
-If the same page is exported again inside the same project-version folder and the target page folder already exists, append a timestamp suffix to avoid overwriting the earlier run.
+If the same complete page is exported again inside the same project-version folder, append a timestamp suffix to avoid overwriting the earlier run. If the existing stable page folder is incomplete, repair that folder on the next successful run instead of creating a duplicate timestamped folder.
 
 Current bundle layout:
 
@@ -43,7 +43,7 @@ xd-metadata.json
 pages.json
 07-Sample-Mobile-Account-Screen/
   artboard-1x.png
-  artboard-2x.png
+  artboard-2x.png  # when --scales includes 2
   metadata.json
 ```
 
@@ -51,13 +51,15 @@ Page folder layout:
 
 ```text
 artboard-1x.png
-artboard-2x.png
+artboard-2x.png  # when --scales includes 2
 metadata.json
 ```
 
+During capture, page outputs are first staged under `.tmp/`. Move the staged folder into the final page folder only after all requested scales and `metadata.json` are complete. Failed partial captures may leave `.tmp/.../capture-errors.json` for debugging, but they should not update `pages.json`.
+
 Recommended downstream consumption:
 
-- frontend or AI visual analysis: `artboard-2x.png`
+- frontend or AI visual analysis: `artboard-2x.png` when present
 - exact design-size image: `artboard-1x.png`
 - page specs plus capture details: `metadata.json`
 - raw XD response metadata snapshot: `xd-metadata.json`

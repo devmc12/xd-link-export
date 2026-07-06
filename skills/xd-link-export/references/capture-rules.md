@@ -11,7 +11,25 @@ Accept these URL shapes:
 5. generic `.../view/.../`
 
 Direct `screen/.../specs/` links are the most stable for screen-specific exports.
-If the input route does not include a `screenId`, resolve metadata from that route first and then capture the first artboard through its canonical `screen/.../specs/` URL.
+Read metadata from any accepted route first, then capture selected artboards through their canonical `screen/.../specs/` URLs.
+
+Page selection:
+
+- Omit `--pages` to export all artboards. `--all` is only the explicit form of the default.
+- Use `--pages "1"` for one page.
+- Use `--pages "1-5,4-7,19"` for mixed ranges and single pages.
+- Use `--pages "01,02,03,13-18"` when page numbers have leading zeros.
+- De-duplicate overlaps while preserving first-seen order.
+- Page failures are always collected while the batch continues.
+- Return a non-zero process exit code if any selected page or requested scale fails.
+
+Scale selection:
+
+- Omit `--scales` to export `1x` only.
+- Use `--scales "1,2"` or `--scales "2,1"` to export both native scales.
+- Use `--scales "2"` to export only `2x`.
+- Reject empty values, non-numeric values, `0`, and values above `2`.
+- Use `--parallel` only when both `1` and `2` are requested; it runs scale workers in parallel, not page workers.
 
 ## Folder Naming
 
@@ -50,6 +68,12 @@ The browser viewport should be large enough for the requested zoom, but not blin
 
 The capture implementation lives in `scripts/capture_xd_artboard.py`. The page bundle entrypoint should call it after metadata has resolved the canonical specs URL and artboard design size.
 
+Capture in scale-major order. For example, a `1,2` request should run all selected pages for one scale, then all selected pages for the other scale, instead of doing `page 1 1x -> page 1 2x -> page 2 1x -> page 2 2x`.
+
+Reuse one browser context and one specs page per scale worker. Navigate that page between selected artboards, but do not switch between `100%` and `200%` inside the same loaded page. This avoids cross-scale XD zoom state pollution while avoiding full browser startup per page.
+
+Wait for `domcontentloaded`, then wait for the visible canvas, zoom input, SVG overlay, and a nonzero artboard rect. Treat `--wait-ms` as the maximum readiness wait, not as a fixed post-navigation sleep.
+
 ## Why Direct JS Canvas Export Fails
 
 The XD viewer render surface is commonly a WebGL canvas. Calling `canvas.toDataURL()` may return a black image. The reliable path is:
@@ -61,7 +85,7 @@ The XD viewer render surface is commonly a WebGL canvas. Calling `canvas.toDataU
 5. hide the SVG overlay stroke
 6. capture the artboard rect from the browser surface
 
-The default export should retain only the final `1x` and `2x` artboard images, written directly into the page folder root.
+The default export should retain only the final requested scale images, written directly into the page folder root.
 
 ## Metadata Source
 

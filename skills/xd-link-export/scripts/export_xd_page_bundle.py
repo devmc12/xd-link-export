@@ -8,11 +8,20 @@ import html
 import json
 import os
 import re
+import shutil
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from capture_xd_artboard import capture_artboard_scales, launch_capture_browser, parse_scale_list
+from capture_xd_artboard import (
+    build_candidate_viewports,
+    capture_scale_on_page,
+    launch_capture_browser,
+    parse_scale_list,
+    wait_for_capture_ui,
+)
 from playwright.sync_api import sync_playwright
 
 
@@ -27,9 +36,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--browser-width", type=int, default=1600, help="Initial metadata viewport width")
     parser.add_argument("--browser-height", type=int, default=1200, help="Initial metadata viewport height")
-    parser.add_argument("--wait-ms", type=int, default=12000, help="Initial wait after navigation")
-    parser.add_argument("--post-zoom-wait-ms", type=int, default=1000, help="Wait after changing XD zoom")
-    parser.add_argument("--capture-scales", default="1,2", help="Comma-separated native output scales")
+    parser.add_argument("--wait-ms", type=int, default=15000, help="Maximum wait for XD UI after navigation")
+    parser.add_argument("--post-zoom-wait-ms", type=int, default=200, help="Short settle wait after changing XD zoom")
+    parser.add_argument("--scales", default="1", help='Native output scales: "1", "2", "1,2", or "2,1"')
+    parser.add_argument(
+        "--pages",
+        help='1-based page selector, for example "1", "1-5,4-7,19", or "01,02,03,13-18"',
+    )
+    parser.add_argument("--all", action="store_true", help="Export all XD pages")
+    parser.add_argument("--parallel", action="store_true", help="Run 1x and 2x scale workers in parallel")
     return parser.parse_args()
 
 
@@ -49,14 +64,6 @@ def safe_path_component(text: str) -> str:
 def normalize_display_title(text: str) -> str:
     # Normalize spacing and underscores for human-readable titles.
     return re.sub(r"\s+", " ", text.replace("_", " ")).strip() or "xd-project"
-
-
-def extract_screen_id(url: str) -> str | None:
-    # Extract a screen UUID from an XD URL.
-    match = re.search(r"/screen/([0-9a-f-]{36})(?:/|$)", url, flags=re.IGNORECASE)
-    if match:
-        return match.group(1)
-    return None
 
 
 def extract_view_base_url(url: str) -> str | None:
@@ -149,25 +156,39 @@ def version_tag_from_modified_date(modified_date_ms: int | None) -> str | None:
     return f"v{dt.month:02d}{dt.day:02d}{dt.hour:02d}{dt.minute:02d}"
 
 
-def resolve_target_screen_id(
-    artboards: list[dict[str, Any]],
-    requested_screen_id: str | None,
-) -> str:
-    # Resolve the requested screen id or fall back to the first artboard.
-    if not artboards:
-        raise RuntimeError("Unable to find any artboards in window.prototypeData.")
+def parse_page_selector(selector: str | None, page_count: int) -> list[int]:
+    # Parse a 1-based XD page selector into unique page indexes.
+    if selector is None or not selector.strip():
+        return list(range(1, page_count + 1))
 
-    if requested_screen_id:
-        if any(artboard.get("id") == requested_screen_id for artboard in artboards):
-            return requested_screen_id
-        raise RuntimeError(
-            f"Unable to find screen id {requested_screen_id} in window.prototypeData manifest artboards."
-        )
+    pages: list[int] = []
+    seen: set[int] = set()
+    for raw_chunk in selector.split(","):
+        chunk = raw_chunk.strip()
+        if not chunk:
+            continue
 
-    first_screen_id = artboards[0].get("id")
-    if not first_screen_id:
-        raise RuntimeError("Unable to resolve a default screen id from the first artboard.")
-    return first_screen_id
+        match = re.fullmatch(r"(\d+)(?:-(\d+))?", chunk)
+        if not match:
+            raise RuntimeError(f"Invalid page selector chunk: {chunk!r}.")
+
+        start = int(match.group(1))
+        end = int(match.group(2) or match.group(1))
+        if start < 1 or end < 1:
+            raise RuntimeError("XD page indexes are 1-based.")
+        if start > end:
+            raise RuntimeError(f"Invalid descending page range: {chunk!r}.")
+        if end > page_count:
+            raise RuntimeError(f"Page range {chunk!r} exceeds XD page count {page_count}.")
+
+        for page_index in range(start, end + 1):
+            if page_index not in seen:
+                pages.append(page_index)
+                seen.add(page_index)
+
+    if not pages:
+        raise RuntimeError("No XD pages were selected.")
+    return pages
 
 
 def build_run_dir(
@@ -183,6 +204,50 @@ def build_run_dir(
         return candidate
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return version_dir / f"{base_name}-{timestamp}"
+
+
+def build_page_dir_base(version_dir: Path, screen_title: str, screen_index: int | None) -> Path:
+    # Build the stable page directory path before collision handling.
+    slug = slugify(screen_title)
+    base_name = f"{screen_index}-{slug}" if screen_index is not None else slug
+    return version_dir / base_name
+
+
+def build_work_dir(version_dir: Path, screen_title: str, screen_index: int | None) -> Path:
+    # Build a temporary page work directory that is committed only after success.
+    slug = slugify(screen_title)
+    base_name = f"{screen_index}-{slug}" if screen_index is not None else slug
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return version_dir / ".tmp" / f"{base_name}-{timestamp}-{os.getpid()}"
+
+
+def is_complete_export_dir(directory: Path, scale_values: list[int]) -> bool:
+    # Check whether a page directory already has all requested final files.
+    if not directory.exists():
+        return False
+    if not (directory / "metadata.json").exists():
+        return False
+    return all((directory / scale_output_name(scale)).exists() for scale in scale_values)
+
+
+def commit_page_work_dir(work_dir: Path, base_dir: Path, scale_values: list[int]) -> Path:
+    # Move a successful temporary page bundle into the final export directory.
+    final_dir = build_run_dir(base_dir.parent, base_dir.name, None) if is_complete_export_dir(base_dir, scale_values) else base_dir
+    final_dir.mkdir(parents=True, exist_ok=True)
+    for item in work_dir.iterdir():
+        target = final_dir / item.name
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        shutil.move(str(item), str(target))
+    try:
+        work_dir.rmdir()
+        work_dir.parent.rmdir()
+    except OSError:
+        pass
+    return final_dir
 
 
 def build_version_dir(output_root: Path, project_title: str, version_tag: str | None) -> Path:
@@ -304,16 +369,238 @@ def update_pages_index(
 
 def read_xd_metadata(page: Any, input_url: str, wait_ms: int) -> dict[str, Any]:
     # Read the XD HTML response, inline prototype data, and resolved route.
-    response = page.goto(input_url, wait_until="load", timeout=90000)
+    response = page.goto(input_url, wait_until="domcontentloaded", timeout=30000)
     if response is None:
         raise RuntimeError("Unable to read the initial XD HTML response.")
     html_text = response.text()
-    page.wait_for_timeout(wait_ms)
+    if wait_ms > 0:
+        page.wait_for_timeout(wait_ms)
     return {
         "htmlText": html_text,
         "resolvedUrl": page.url,
         "prototypeData": extract_inline_json_assignment(html_text, "window.prototypeData"),
     }
+
+
+def scale_key(scale_value: int) -> str:
+    # Format a native scale value for output metadata.
+    return f"{scale_value}x"
+
+
+def scale_output_name(scale_value: int) -> str:
+    # Build the PNG file name for a native scale value.
+    return "artboard-1x.png" if scale_value == 1 else f"artboard-{scale_value}x.png"
+
+
+def build_page_export_plan(
+    version_dir: Path,
+    artboard: dict[str, Any],
+    screen_index: int,
+    screen_count: int,
+    project_title: str,
+    modified_date: int | None,
+    root_dir: Path,
+    view_base_url: str,
+) -> dict[str, Any]:
+    # Prepare one page directory and immutable source metadata before capture.
+    screen_id = artboard.get("id")
+    if not screen_id:
+        raise RuntimeError(f"Unable to resolve a screen id for page index {screen_index}.")
+
+    current_page_source = build_page_source_entry(artboard, screen_index, view_base_url)
+    screen_title = artboard.get("name") or f"xd-screen-{screen_index}"
+    capture_url = build_screen_specs_url(view_base_url, screen_id)
+    base_dir = build_page_dir_base(version_dir, screen_title, screen_index)
+    work_dir = build_work_dir(version_dir, screen_title, screen_index)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    return {
+        "artboard": artboard,
+        "source": current_page_source,
+        "screenIndex": screen_index,
+        "screenCount": screen_count,
+        "screenId": screen_id,
+        "screenTitle": screen_title,
+        "captureUrl": capture_url,
+        "baseDir": base_dir,
+        "workDir": work_dir,
+        "runDir": None,
+        "projectTitle": project_title,
+        "modifiedDate": modified_date,
+        "rootDir": root_dir,
+    }
+
+
+def capture_scale_worker(
+    scale_value: int,
+    page_plans: list[dict[str, Any]],
+    wait_ms: int,
+    post_zoom_wait_ms: int,
+) -> dict[str, Any]:
+    # Capture one native scale for all selected pages while reusing one specs page.
+    results: dict[int, dict[str, Any]] = {}
+    errors: list[dict[str, Any]] = []
+    key = scale_key(scale_value)
+
+    try:
+        with sync_playwright() as p:
+            browser = launch_capture_browser(p)
+            try:
+                context: Any | None = None
+                page: Any | None = None
+                first_plan = page_plans[0]
+                initial_viewport = build_candidate_viewports(
+                    first_plan["source"]["designWidth"],
+                    first_plan["source"]["designHeight"],
+                    scale_value,
+                )[0]
+                context = browser.new_context(viewport=initial_viewport, device_scale_factor=1)
+                page = context.new_page()
+                try:
+                    for plan in page_plans:
+                        output_path = plan["workDir"] / scale_output_name(scale_value)
+                        try:
+                            page.set_viewport_size(
+                                build_candidate_viewports(
+                                    plan["source"]["designWidth"],
+                                    plan["source"]["designHeight"],
+                                    scale_value,
+                                )[0]
+                            )
+                            page.goto(
+                                plan["captureUrl"],
+                                wait_until="domcontentloaded",
+                                timeout=max(wait_ms + 5000, 20000),
+                            )
+                            wait_for_capture_ui(page, wait_ms)
+                            capture = capture_scale_on_page(
+                                page=page,
+                                output_path=output_path,
+                                design_width=plan["source"]["designWidth"],
+                                design_height=plan["source"]["designHeight"],
+                                scale_value=scale_value,
+                                post_zoom_wait_ms=post_zoom_wait_ms,
+                            )
+                            results[plan["screenIndex"]] = {
+                                "files": {key: str(output_path)},
+                                "scales": {key: capture},
+                            }
+                        except Exception as exc:
+                            errors.append(
+                                {
+                                    "screenIndex": plan["screenIndex"],
+                                    "screenId": plan["screenId"],
+                                    "screenTitle": plan["screenTitle"],
+                                    "scale": key,
+                                    "error": {"type": exc.__class__.__name__, "message": str(exc)},
+                                }
+                            )
+                finally:
+                    if page is not None:
+                        page.close()
+                    if context is not None:
+                        context.close()
+            finally:
+                browser.close()
+    except Exception as exc:
+        for plan in page_plans:
+            errors.append(
+                {
+                    "screenIndex": plan["screenIndex"],
+                    "screenId": plan["screenId"],
+                    "screenTitle": plan["screenTitle"],
+                    "scale": key,
+                    "error": {"type": exc.__class__.__name__, "message": str(exc)},
+                }
+            )
+
+    return {"scale": scale_value, "results": results, "errors": errors}
+
+
+def capture_selected_scales(
+    scale_values: list[int],
+    page_plans: list[dict[str, Any]],
+    wait_ms: int,
+    post_zoom_wait_ms: int,
+    parallel: bool,
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]], bool]:
+    # Run scale-major capture, optionally parallelizing the 1x and 2x workers.
+    capture_by_page = {
+        plan["screenIndex"]: {"strategy": "xd-zoom-svg-rect", "files": {}, "scales": {}, "errors": []}
+        for plan in page_plans
+    }
+    all_errors: list[dict[str, Any]] = []
+    run_parallel = parallel and len(scale_values) > 1
+    if not page_plans:
+        return capture_by_page, all_errors, False
+
+    def merge_worker_result(worker_result: dict[str, Any]) -> None:
+        for screen_index, result in worker_result["results"].items():
+            capture_by_page[screen_index]["files"].update(result["files"])
+            capture_by_page[screen_index]["scales"].update(result["scales"])
+        for error in worker_result["errors"]:
+            all_errors.append(error)
+            capture_by_page[error["screenIndex"]]["errors"].append(error)
+
+    if run_parallel:
+        with ThreadPoolExecutor(max_workers=len(scale_values)) as executor:
+            futures = [
+                executor.submit(capture_scale_worker, scale, page_plans, wait_ms, post_zoom_wait_ms)
+                for scale in scale_values
+            ]
+            for future in as_completed(futures):
+                merge_worker_result(future.result())
+    else:
+        for scale in scale_values:
+            merge_worker_result(capture_scale_worker(scale, page_plans, wait_ms, post_zoom_wait_ms))
+
+    return capture_by_page, all_errors, run_parallel
+
+
+def write_page_metadata(
+    plan: dict[str, Any],
+    capture_result: dict[str, Any],
+    version_dir: Path,
+    xd_metadata_path: Path,
+    root_dir: Path,
+) -> dict[str, Any]:
+    # Write the merged page source and capture metadata for one selected page.
+    current_page_source = plan["source"]
+    scale_outputs_rel = {
+        key: relative_path_str(Path(path), root_dir)
+        for key, path in capture_result.get("files", {}).items()
+    }
+    metadata = {
+        "source": {
+            "url": current_page_source["url"],
+            "projectTitle": plan["projectTitle"],
+            "modifiedDate": plan["modifiedDate"],
+            "screenId": plan["screenId"],
+            "screenTitle": plan["screenTitle"],
+            "screenIndex": plan["screenIndex"],
+            "screenCount": plan["screenCount"],
+            "viewportWidth": current_page_source["viewportWidth"],
+            "viewportHeight": current_page_source["viewportHeight"],
+            "designWidth": current_page_source["designWidth"],
+            "designHeight": current_page_source["designHeight"],
+        },
+        "capture": {
+            "strategy": capture_result["strategy"],
+            "scales": capture_result["scales"],
+        },
+        "outputs": {
+            "versionDirectory": relative_path_str(version_dir, root_dir),
+            "directory": relative_path_str(plan["runDir"], root_dir),
+            "xdMetadataFile": relative_path_str(xd_metadata_path, root_dir),
+            "files": scale_outputs_rel,
+        },
+    }
+    if capture_result.get("errors"):
+        metadata["capture"]["errors"] = capture_result["errors"]
+
+    metadata_path = plan["runDir"] / "metadata.json"
+    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return metadata
 
 
 def main() -> int:
@@ -322,14 +609,21 @@ def main() -> int:
     output_root = Path(args.output_root)
     root_dir = Path.cwd()
     input_url = args.url
-    exported_at = datetime.now().isoformat(timespec="seconds")
+    try:
+        scale_values = parse_scale_list(args.scales)
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.pages and args.all:
+        raise RuntimeError("Use either --pages or --all, not both.")
 
     with sync_playwright() as p:
         browser = launch_capture_browser(p)
         try:
             page = browser.new_page(viewport={"width": args.browser_width, "height": args.browser_height})
             try:
-                metadata_source = read_xd_metadata(page, input_url, args.wait_ms)
+                metadata_source = read_xd_metadata(page, input_url, 0)
             finally:
                 page.close()
 
@@ -343,12 +637,9 @@ def main() -> int:
             manifest = prototype_data.get("manifest", {})
             artboards = manifest.get("artboards", [])
             screen_count = len(artboards)
-            requested_screen_id = extract_screen_id(input_resolved_url) or extract_screen_id(input_url)
-            screen_id = resolve_target_screen_id(artboards, requested_screen_id)
-            capture_url = build_screen_specs_url(view_base_url, screen_id)
-            matched_index = next(index for index, artboard in enumerate(artboards) if artboard.get("id") == screen_id)
+            if not artboards:
+                raise RuntimeError("Unable to find any artboards in window.prototypeData.")
 
-            artboard = artboards[matched_index]
             project_title = (
                 manifest.get("name")
                 or extract_meta_content(html_text, "property", "og:title")
@@ -356,22 +647,9 @@ def main() -> int:
                 or extract_document_title(html_text)
                 or "xd-project"
             )
-            screen_title = (
-                artboard.get("name")
-                or extract_meta_content(html_text, "property", "og:title")
-                or extract_meta_content(html_text, "name", "twitter:title")
-                or extract_document_title(html_text)
-                or "xd-screen"
-            )
             modified_date = prototype_data.get("modifiedDate")
             version_tag = version_tag_from_modified_date(modified_date)
-            screen_index = matched_index + 1
-            current_page_source = build_page_source_entry(artboard, screen_index, view_base_url)
-            design_width = current_page_source["designWidth"]
-            design_height = current_page_source["designHeight"]
-            viewport_width = current_page_source["viewportWidth"]
-            viewport_height = current_page_source["viewportHeight"]
-            screen_url = current_page_source["url"]
+            target_page_indexes = parse_page_selector(args.pages, screen_count)
 
             version_dir = build_version_dir(output_root, project_title, version_tag)
             version_dir.mkdir(parents=True, exist_ok=True)
@@ -381,69 +659,136 @@ def main() -> int:
                 encoding="utf-8",
             )
 
-            run_dir = build_run_dir(version_dir, screen_title, screen_index)
-            run_dir.mkdir(parents=True, exist_ok=True)
-
-            capture_result = capture_artboard_scales(
-                browser=browser,
-                capture_url=capture_url,
-                output_dir=run_dir,
-                design_width=design_width,
-                design_height=design_height,
-                scale_values=parse_scale_list(args.capture_scales),
-                wait_ms=args.wait_ms,
-                post_zoom_wait_ms=args.post_zoom_wait_ms,
-            )
+            page_plans: list[dict[str, Any]] = []
+            exports: list[dict[str, Any]] = []
+            errors: list[dict[str, Any]] = []
+            for screen_index in target_page_indexes:
+                artboard = artboards[screen_index - 1]
+                try:
+                    page_plans.append(
+                        build_page_export_plan(
+                            version_dir=version_dir,
+                            artboard=artboard,
+                            screen_index=screen_index,
+                            screen_count=screen_count,
+                            project_title=project_title,
+                            modified_date=modified_date,
+                            root_dir=root_dir,
+                            view_base_url=view_base_url,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(
+                        {
+                            "screenIndex": screen_index,
+                            "screenId": artboard.get("id"),
+                            "screenTitle": artboard.get("name"),
+                            "stage": "planning",
+                            "error": {"type": exc.__class__.__name__, "message": str(exc)},
+                        }
+                    )
         finally:
             browser.close()
 
-    scale_outputs_rel = {
-        key: relative_path_str(Path(path), root_dir)
-        for key, path in capture_result["files"].items()
-    }
-    metadata = {
-        "source": {
-            "url": screen_url,
-            "projectTitle": project_title,
-            "modifiedDate": modified_date,
-            "screenId": screen_id,
-            "screenTitle": screen_title,
-            "screenIndex": screen_index,
-            "screenCount": screen_count,
-            "viewportWidth": viewport_width,
-            "viewportHeight": viewport_height,
-            "designWidth": design_width,
-            "designHeight": design_height,
-        },
-        "capture": {
-            "strategy": capture_result["strategy"],
-            "scales": capture_result["scales"],
-        },
-        "outputs": {
-            "versionDirectory": relative_path_str(version_dir, root_dir),
-            "directory": relative_path_str(run_dir, root_dir),
-            "xdMetadataFile": relative_path_str(xd_metadata_path, root_dir),
-            "files": scale_outputs_rel,
-        },
-    }
-    metadata_path = run_dir / "metadata.json"
-    metadata_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-    update_pages_index(
-        pages_index_path=version_dir / "pages.json",
-        prototype_data=prototype_data,
-        version_dir=version_dir,
-        run_dir=run_dir,
-        current_page_source=current_page_source,
-        project_title=project_title,
-        modified_date=modified_date,
-        version_tag=version_tag,
-        root_dir=root_dir,
-        exported_at=exported_at,
-        view_base_url=view_base_url,
+    capture_by_page, capture_errors, parallel_used = capture_selected_scales(
+        scale_values=scale_values,
+        page_plans=page_plans,
+        wait_ms=args.wait_ms,
+        post_zoom_wait_ms=args.post_zoom_wait_ms,
+        parallel=args.parallel,
     )
-    print(json.dumps(metadata, ensure_ascii=False, indent=2))
-    return 0
+    errors.extend(capture_errors)
+
+    for plan in page_plans:
+        try:
+            capture_result = capture_by_page[plan["screenIndex"]]
+            missing_scales = [
+                scale_key(scale)
+                for scale in scale_values
+                if scale_key(scale) not in capture_result.get("files", {})
+            ]
+            if missing_scales or capture_result.get("errors"):
+                if missing_scales:
+                    errors.append(
+                        {
+                            "screenIndex": plan["screenIndex"],
+                            "screenId": plan["screenId"],
+                            "screenTitle": plan["screenTitle"],
+                            "stage": "capture",
+                            "error": {
+                                "type": "MissingScaleOutput",
+                                "message": f"Missing requested scale outputs: {', '.join(missing_scales)}",
+                            },
+                        }
+                    )
+                plan["workDir"].mkdir(parents=True, exist_ok=True)
+                (plan["workDir"] / "capture-errors.json").write_text(
+                    json.dumps(capture_result.get("errors", []), ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                continue
+
+            plan["runDir"] = commit_page_work_dir(plan["workDir"], plan["baseDir"], scale_values)
+            capture_result["files"] = {
+                key: str(plan["runDir"] / Path(path).name)
+                for key, path in capture_result.get("files", {}).items()
+            }
+            metadata = write_page_metadata(
+                plan=plan,
+                capture_result=capture_result,
+                version_dir=version_dir,
+                xd_metadata_path=xd_metadata_path,
+                root_dir=root_dir,
+            )
+            update_pages_index(
+                pages_index_path=version_dir / "pages.json",
+                prototype_data=prototype_data,
+                version_dir=version_dir,
+                run_dir=plan["runDir"],
+                current_page_source=plan["source"],
+                project_title=project_title,
+                modified_date=modified_date,
+                version_tag=version_tag,
+                root_dir=root_dir,
+                exported_at=datetime.now().isoformat(timespec="seconds"),
+                view_base_url=view_base_url,
+            )
+            exports.append(metadata)
+        except Exception as exc:
+            errors.append(
+                {
+                    "screenIndex": plan["screenIndex"],
+                    "screenId": plan["screenId"],
+                    "screenTitle": plan["screenTitle"],
+                    "stage": "metadata",
+                    "error": {"type": exc.__class__.__name__, "message": str(exc)},
+                }
+            )
+
+    if len(exports) == 1 and not errors:
+        print(json.dumps(exports[0], ensure_ascii=False, indent=2))
+    else:
+        summary = {
+            "project": {
+                "projectTitle": project_title,
+                "modifiedDate": modified_date,
+                "versionTag": version_tag,
+                "screenCount": screen_count,
+                "url": build_grid_url(view_base_url),
+                "versionDirectory": relative_path_str(version_dir, root_dir),
+                "xdMetadataFile": relative_path_str(xd_metadata_path, root_dir),
+            },
+            "selection": {
+                "pages": target_page_indexes,
+                "all": args.pages is None,
+                "scales": [scale_key(scale) for scale in scale_values],
+                "parallel": parallel_used,
+            },
+            "exports": exports,
+            "errors": errors,
+        }
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

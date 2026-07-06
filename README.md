@@ -18,7 +18,7 @@ It is mainly built for design-share-link-to-frontend, design analysis, and autom
 ### Screenshot export
 
 - remove viewer chrome and outer blank margins
-- export native `artboard-1x.png` and `artboard-2x.png`
+- export native `artboard-1x.png` by default, with optional `artboard-2x.png`
 - use XD specs zoom plus SVG artboard rect geometry for stable long-page capture
 
 ### Metadata export
@@ -87,8 +87,26 @@ python -m playwright install chromium
 ```powershell
 cd skills/xd-link-export
 python scripts/export_xd_page_bundle.py `
-  --url "https://xd.adobe.com/view/SHARE_ID/screen/SCREEN_ID/specs/"
+  --url "https://xd.adobe.com/view/SHARE_ID/grid"
 ```
+
+By default, all pages are exported. Select pages with one `--pages` argument:
+
+```powershell
+python scripts/export_xd_page_bundle.py `
+  --url "https://xd.adobe.com/view/SHARE_ID/grid" `
+  --pages "1-3,16,25-30"
+```
+
+`--pages` accepts forms like `1`, `1-5,4-7,19`, and `01,02,03,13-18`.
+
+By default, the exporter writes only `1x`. Use `--scales "1,2"` for both `1x` and `2x`, or `--scales "2"` for only `2x`. Accepted forms are `1`, `2`, `1,2`, and `2,1`; values above `2` are invalid.
+
+Page errors are always collected while the batch continues. If any page or requested scale fails, the final process exit code is non-zero and the JSON summary includes `errors`.
+
+Use `--parallel` only with `--scales "1,2"` or `--scales "2,1"` to run separate 1x and 2x scale workers at the same time.
+
+Capture uses `domcontentloaded` plus XD canvas/zoom/overlay readiness checks. `--wait-ms` is the maximum UI readiness wait, not a fixed sleep after every navigation.
 
 ## Output
 
@@ -99,9 +117,11 @@ python scripts/export_xd_page_bundle.py `
     pages.json
     PAGE_INDEX-SCREEN_SLUG/
       artboard-1x.png
-      artboard-2x.png
+      artboard-2x.png  # when --scales includes 2
       metadata.json
 ```
+
+Page outputs are staged under `.tmp/` first and committed to the final page folder only after every requested scale succeeds. If a previous page folder is incomplete, the next successful run repairs that stable folder instead of creating a duplicate timestamped folder; timestamp suffixes are reserved for repeated complete exports.
 
 ## Related
 
