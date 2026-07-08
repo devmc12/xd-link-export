@@ -256,13 +256,18 @@ def build_work_dir(version_dir: Path, screen_title: str, screen_index: int | Non
     return version_dir / ".tmp" / f"{base_name}-{timestamp}-{os.getpid()}"
 
 
-def is_complete_export_dir(directory: Path, scale_values: list[int], thumbnail_url: str | None = None) -> bool:
+def is_complete_export_dir(
+    directory: Path,
+    scale_values: list[int],
+    thumbnail_url: str | None = None,
+    thumbnail_png: bytes | None = None,
+) -> bool:
     # Check whether a page directory already has all requested valid final files.
     if not directory.exists():
         return False
     if not (directory / "metadata.json").exists():
         return False
-    reference_png = download_reference_png(thumbnail_url) if thumbnail_url else None
+    reference_png = thumbnail_png or (download_reference_png(thumbnail_url) if thumbnail_url else None)
     for scale in scale_values:
         output_path = directory / scale_output_name(scale)
         if not output_path.exists():
@@ -282,11 +287,12 @@ def commit_page_work_dir(
     base_dir: Path,
     scale_values: list[int],
     thumbnail_url: str | None = None,
+    thumbnail_png: bytes | None = None,
 ) -> Path:
     # Move a successful temporary page bundle into the final export directory.
     final_dir = (
         build_run_dir(base_dir.parent, base_dir.name, None)
-        if is_complete_export_dir(base_dir, scale_values, thumbnail_url)
+        if is_complete_export_dir(base_dir, scale_values, thumbnail_url, thumbnail_png)
         else base_dir
     )
     final_dir.mkdir(parents=True, exist_ok=True)
@@ -467,6 +473,7 @@ def build_page_export_plan(
     current_page_source = build_page_source_entry(artboard, screen_index, view_base_url)
     screen_title = artboard.get("name") or f"xd-screen-{screen_index}"
     capture_url = build_screen_specs_url(view_base_url, screen_id)
+    thumbnail_url = build_thumbnail_url(prototype_data, artboard)
     base_dir = build_page_dir_base(version_dir, screen_title, screen_index)
     work_dir = build_work_dir(version_dir, screen_title, screen_index)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -479,7 +486,8 @@ def build_page_export_plan(
         "screenId": screen_id,
         "screenTitle": screen_title,
         "captureUrl": capture_url,
-        "thumbnailUrl": build_thumbnail_url(prototype_data, artboard),
+        "thumbnailUrl": thumbnail_url,
+        "thumbnailPng": download_reference_png(thumbnail_url) if thumbnail_url else None,
         "baseDir": base_dir,
         "workDir": work_dir,
         "runDir": None,
@@ -535,6 +543,7 @@ def capture_scale_worker(
                                 scale_value=scale_value,
                                 post_zoom_wait_ms=post_zoom_wait_ms,
                                 thumbnail_url=plan.get("thumbnailUrl"),
+                                thumbnail_png=plan.get("thumbnailPng"),
                             )
                             results[plan["screenIndex"]] = {
                                 "files": {key: str(output_path)},
@@ -798,6 +807,7 @@ def main() -> int:
                 plan["baseDir"],
                 scale_values,
                 plan.get("thumbnailUrl"),
+                plan.get("thumbnailPng"),
             )
             capture_result["files"] = {
                 key: str(plan["runDir"] / Path(path).name)

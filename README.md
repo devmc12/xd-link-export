@@ -76,7 +76,7 @@ pip install -r requirements.txt
 ```
 
 - If the host machine already has Chrome, no extra browser download is required
-- If Chrome is unavailable, install Playwright's bundled Chromium:
+- If Chrome is unavailable, install Chrome or Playwright's bundled Chromium:
 
 ```powershell
 python -m playwright install chromium
@@ -84,13 +84,15 @@ python -m playwright install chromium
 
 ## Run
 
+Export all pages:
+
 ```powershell
 cd skills/xd-link-export
 python scripts/export_xd_page_bundle.py `
   --url "https://xd.adobe.com/view/SHARE_ID/grid"
 ```
 
-By default, all pages are exported. Select pages with one `--pages` argument:
+Select pages with one `--pages` argument:
 
 ```powershell
 python scripts/export_xd_page_bundle.py `
@@ -100,7 +102,26 @@ python scripts/export_xd_page_bundle.py `
 
 `--pages` accepts forms like `1`, `1-5,4-7,19`, and `01,02,03,13-18`.
 
-By default, the exporter writes only `1x`. Use `--scales "1,2"` for both `1x` and `2x`, or `--scales "2"` for only `2x`. Accepted forms are `1`, `2`, `1,2`, and `2,1`; values above `2` are invalid.
+Export both `1x` and `2x`:
+
+```powershell
+python scripts/export_xd_page_bundle.py `
+  --url "https://xd.adobe.com/view/SHARE_ID/grid" `
+  --pages "1-3,16,25-30" `
+  --scales "1,2"
+```
+
+By default, the exporter writes only `1x`. Use `--scales "2"` for only `2x`. Accepted scale forms are `1`, `2`, `1,2`, and `2,1`; values above `2` are invalid.
+
+Run 1x and 2x workers in parallel:
+
+```powershell
+python scripts/export_xd_page_bundle.py `
+  --url "https://xd.adobe.com/view/SHARE_ID/grid" `
+  --pages "1-3,16,25-30" `
+  --scales "1,2" `
+  --parallel
+```
 
 Page errors are always collected while the batch continues. If any page or requested scale fails, the final process exit code is non-zero and the JSON summary includes `errors`.
 

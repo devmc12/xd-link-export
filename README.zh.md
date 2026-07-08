@@ -76,7 +76,7 @@ pip install -r requirements.txt
 ```
 
 - 如果宿主机已经安装 Chrome，脚本会直接使用它
-- 如果没有 Chrome，请安装 Playwright 自带的 Chromium：
+- 如果没有 Chrome，请安装 Chrome，或者安装 Playwright 自带的 Chromium：
 
 ```powershell
 python -m playwright install chromium
@@ -84,13 +84,15 @@ python -m playwright install chromium
 
 ## 运行
 
+导出全部页面：
+
 ```powershell
 cd skills/xd-link-export
 python scripts/export_xd_page_bundle.py `
   --url "https://xd.adobe.com/view/SHARE_ID/grid"
 ```
 
-默认导出全部页面。用一个 `--pages` 参数选择页码：
+导出指定页码：
 
 ```powershell
 python scripts/export_xd_page_bundle.py `
@@ -100,7 +102,26 @@ python scripts/export_xd_page_bundle.py `
 
 `--pages` 支持 `1`、`1-5,4-7,19`、`01,02,03,13-18`。
 
-默认只导出 `1x`。用 `--scales "1,2"` 同时导出 `1x` 和 `2x`，或用 `--scales "2"` 只导出 `2x`。`--scales` 只接受 `1`、`2`、`1,2`、`2,1`，大于 `2` 的值无效。
+同时导出 `1x` 和 `2x`：
+
+```powershell
+python scripts/export_xd_page_bundle.py `
+  --url "https://xd.adobe.com/view/SHARE_ID/grid" `
+  --pages "1-3,16,25-30" `
+  --scales "1,2"
+```
+
+默认只导出 `1x`。用 `--scales "2"` 只导出 `2x`。`--scales` 只接受 `1`、`2`、`1,2`、`2,1`，大于 `2` 的值无效。
+
+并行导出 `1x` 和 `2x`：
+
+```powershell
+python scripts/export_xd_page_bundle.py `
+  --url "https://xd.adobe.com/view/SHARE_ID/grid" `
+  --pages "1-3,16,25-30" `
+  --scales "1,2" `
+  --parallel
+```
 
 批量导出时，页面或 scale 失败会被收集到 summary/errors，流程继续跑后续页面。只要有任何失败，最终进程退出码就是非 0，避免误判为全成功。
 

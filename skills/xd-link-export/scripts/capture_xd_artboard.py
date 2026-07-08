@@ -586,12 +586,13 @@ def capture_scale_on_page(
     scale_value: int,
     post_zoom_wait_ms: int,
     thumbnail_url: str | None = None,
+    thumbnail_png: bytes | None = None,
 ) -> dict[str, Any]:
     # Export one native-scale artboard PNG on an already-loaded XD specs page.
     target_width = design_width * scale_value
     target_height = design_height * scale_value
     attempts: list[dict[str, Any]] = []
-    reference_png = download_reference_png(thumbnail_url) if thumbnail_url else None
+    reference_png = thumbnail_png or (download_reference_png(thumbnail_url) if thumbnail_url else None)
 
     for viewport in build_candidate_viewports(design_width, design_height, scale_value):
         try:
@@ -677,6 +678,7 @@ def capture_scale_output(
     wait_ms: int,
     post_zoom_wait_ms: int,
     thumbnail_url: str | None = None,
+    thumbnail_png: bytes | None = None,
 ) -> dict[str, Any]:
     # Export one native-scale artboard PNG through XD zoom and overlay rect geometry.
     initial_viewport = build_candidate_viewports(design_width, design_height, scale_value)[0]
@@ -693,6 +695,7 @@ def capture_scale_output(
             scale_value=scale_value,
             post_zoom_wait_ms=post_zoom_wait_ms,
             thumbnail_url=thumbnail_url,
+            thumbnail_png=thumbnail_png,
         )
     finally:
         page.close()
@@ -709,6 +712,7 @@ def capture_artboard_scales(
     wait_ms: int,
     post_zoom_wait_ms: int,
     thumbnail_url: str | None = None,
+    thumbnail_png: bytes | None = None,
 ) -> dict[str, Any]:
     # Capture each requested native artboard scale in an isolated XD specs page.
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -729,6 +733,7 @@ def capture_artboard_scales(
             wait_ms=wait_ms,
             post_zoom_wait_ms=post_zoom_wait_ms,
             thumbnail_url=thumbnail_url,
+            thumbnail_png=thumbnail_png,
         )
         files[scale_key] = str(output_path)
 
