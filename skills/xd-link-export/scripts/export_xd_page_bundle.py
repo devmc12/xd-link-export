@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import sys
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
@@ -18,8 +19,11 @@ from typing import Any
 from capture_xd_artboard import (
     build_candidate_viewports,
     capture_scale_on_page,
+    download_reference_png,
+    goto_xd_capture_page,
     launch_capture_browser,
     parse_scale_list,
+    validate_thumbnail_reference,
     wait_for_capture_ui,
 )
 from playwright.sync_api import sync_playwright
@@ -87,6 +91,37 @@ def build_screen_url(view_base_url: str, screen_id: str) -> str:
 def build_screen_specs_url(view_base_url: str, screen_id: str) -> str:
     # Build the canonical specs route for a screen id.
     return build_screen_url(view_base_url, screen_id) + "specs/"
+
+
+def build_thumbnail_url(prototype_data: dict[str, Any], artboard: dict[str, Any]) -> str | None:
+    # Build the XD CDN URL for an artboard thumbnail component.
+    link_template = prototype_data.get("linkTemplate")
+    if not link_template:
+        return None
+    thumbnail_component = next(
+        (component for component in artboard.get("components", []) if component.get("rel") == "thumbnail"),
+        None,
+    )
+    if not thumbnail_component:
+        return None
+
+    base = link_template.get("href", "").split("{", 1)[0]
+    data = link_template.get("data", {})
+    api_key = data.get("api_key")
+    access_token = data.get("access_token")
+    component_id = thumbnail_component.get("id")
+    revision = thumbnail_component.get("revision")
+    if not all([base, api_key, access_token, component_id, revision]):
+        return None
+
+    params = urllib.parse.urlencode(
+        {
+            "api_key": api_key,
+            "access_token": access_token,
+            "component_id": component_id,
+        }
+    )
+    return f"{base};revision={revision}?{params}"
 
 
 def extract_inline_json_assignment(html_text: str, assignment_name: str) -> Any:
@@ -221,18 +256,39 @@ def build_work_dir(version_dir: Path, screen_title: str, screen_index: int | Non
     return version_dir / ".tmp" / f"{base_name}-{timestamp}-{os.getpid()}"
 
 
-def is_complete_export_dir(directory: Path, scale_values: list[int]) -> bool:
-    # Check whether a page directory already has all requested final files.
+def is_complete_export_dir(directory: Path, scale_values: list[int], thumbnail_url: str | None = None) -> bool:
+    # Check whether a page directory already has all requested valid final files.
     if not directory.exists():
         return False
     if not (directory / "metadata.json").exists():
         return False
-    return all((directory / scale_output_name(scale)).exists() for scale in scale_values)
+    reference_png = download_reference_png(thumbnail_url) if thumbnail_url else None
+    for scale in scale_values:
+        output_path = directory / scale_output_name(scale)
+        if not output_path.exists():
+            return False
+        if reference_png:
+            try:
+                validation = validate_thumbnail_reference(output_path.read_bytes(), reference_png)
+            except Exception:
+                return False
+            if not validation["pass"]:
+                return False
+    return True
 
 
-def commit_page_work_dir(work_dir: Path, base_dir: Path, scale_values: list[int]) -> Path:
+def commit_page_work_dir(
+    work_dir: Path,
+    base_dir: Path,
+    scale_values: list[int],
+    thumbnail_url: str | None = None,
+) -> Path:
     # Move a successful temporary page bundle into the final export directory.
-    final_dir = build_run_dir(base_dir.parent, base_dir.name, None) if is_complete_export_dir(base_dir, scale_values) else base_dir
+    final_dir = (
+        build_run_dir(base_dir.parent, base_dir.name, None)
+        if is_complete_export_dir(base_dir, scale_values, thumbnail_url)
+        else base_dir
+    )
     final_dir.mkdir(parents=True, exist_ok=True)
     for item in work_dir.iterdir():
         target = final_dir / item.name
@@ -395,6 +451,7 @@ def scale_output_name(scale_value: int) -> str:
 def build_page_export_plan(
     version_dir: Path,
     artboard: dict[str, Any],
+    prototype_data: dict[str, Any],
     screen_index: int,
     screen_count: int,
     project_title: str,
@@ -422,6 +479,7 @@ def build_page_export_plan(
         "screenId": screen_id,
         "screenTitle": screen_title,
         "captureUrl": capture_url,
+        "thumbnailUrl": build_thumbnail_url(prototype_data, artboard),
         "baseDir": base_dir,
         "workDir": work_dir,
         "runDir": None,
@@ -467,11 +525,7 @@ def capture_scale_worker(
                                     scale_value,
                                 )[0]
                             )
-                            page.goto(
-                                plan["captureUrl"],
-                                wait_until="domcontentloaded",
-                                timeout=max(wait_ms + 5000, 20000),
-                            )
+                            goto_xd_capture_page(page, plan["captureUrl"], wait_ms)
                             wait_for_capture_ui(page, wait_ms)
                             capture = capture_scale_on_page(
                                 page=page,
@@ -480,6 +534,7 @@ def capture_scale_worker(
                                 design_height=plan["source"]["designHeight"],
                                 scale_value=scale_value,
                                 post_zoom_wait_ms=post_zoom_wait_ms,
+                                thumbnail_url=plan.get("thumbnailUrl"),
                             )
                             results[plan["screenIndex"]] = {
                                 "files": {key: str(output_path)},
@@ -526,7 +581,16 @@ def capture_selected_scales(
 ) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]], bool]:
     # Run scale-major capture, optionally parallelizing the 1x and 2x workers.
     capture_by_page = {
-        plan["screenIndex"]: {"strategy": "xd-zoom-svg-rect", "files": {}, "scales": {}, "errors": []}
+        plan["screenIndex"]: {
+            "strategy": (
+                "xd-zoom-svg-rect-thumbnail-reference"
+                if plan.get("thumbnailUrl")
+                else "xd-zoom-svg-rect"
+            ),
+            "files": {},
+            "scales": {},
+            "errors": [],
+        }
         for plan in page_plans
     }
     all_errors: list[dict[str, Any]] = []
@@ -669,6 +733,7 @@ def main() -> int:
                         build_page_export_plan(
                             version_dir=version_dir,
                             artboard=artboard,
+                            prototype_data=prototype_data,
                             screen_index=screen_index,
                             screen_count=screen_count,
                             project_title=project_title,
@@ -728,7 +793,12 @@ def main() -> int:
                 )
                 continue
 
-            plan["runDir"] = commit_page_work_dir(plan["workDir"], plan["baseDir"], scale_values)
+            plan["runDir"] = commit_page_work_dir(
+                plan["workDir"],
+                plan["baseDir"],
+                scale_values,
+                plan.get("thumbnailUrl"),
+            )
             capture_result["files"] = {
                 key: str(plan["runDir"] / Path(path).name)
                 for key, path in capture_result.get("files", {}).items()

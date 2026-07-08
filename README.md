@@ -19,7 +19,7 @@ It is mainly built for design-share-link-to-frontend, design analysis, and autom
 
 - remove viewer chrome and outer blank margins
 - export native `artboard-1x.png` by default, with optional `artboard-2x.png`
-- use XD specs zoom plus SVG artboard rect geometry for stable long-page capture
+- use XD specs zoom, SVG artboard rect geometry, and XD thumbnail reference validation for stable long-page capture
 
 ### Metadata export
 
@@ -106,7 +106,7 @@ Page errors are always collected while the batch continues. If any page or reque
 
 Use `--parallel` only with `--scales "1,2"` or `--scales "2,1"` to run separate 1x and 2x scale workers at the same time.
 
-Capture uses `domcontentloaded` plus XD canvas/zoom/overlay readiness checks. `--wait-ms` is the maximum UI readiness wait, not a fixed sleep after every navigation.
+Capture uses `domcontentloaded` plus XD canvas/zoom/overlay readiness checks. Before writing a PNG, it compares the captured artboard against XD's own thumbnail reference so loading masks are not committed as final output. `--wait-ms` is the maximum UI readiness wait, not a fixed sleep after every navigation.
 
 ## Output
 
@@ -121,7 +121,7 @@ Capture uses `domcontentloaded` plus XD canvas/zoom/overlay readiness checks. `-
       metadata.json
 ```
 
-Page outputs are staged under `.tmp/` first and committed to the final page folder only after every requested scale succeeds. If a previous page folder is incomplete, the next successful run repairs that stable folder instead of creating a duplicate timestamped folder; timestamp suffixes are reserved for repeated complete exports.
+Page outputs are staged under `.tmp/` first and committed to the final page folder only after every requested scale succeeds and passes reference validation. If a previous page folder is incomplete or visually stale, the next successful run repairs that stable folder instead of creating a duplicate timestamped folder; timestamp suffixes are reserved for repeated complete exports.
 
 ## Related
 

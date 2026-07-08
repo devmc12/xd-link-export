@@ -55,7 +55,7 @@ artboard-2x.png  # when --scales includes 2
 metadata.json
 ```
 
-During capture, page outputs are first staged under `.tmp/`. Move the staged folder into the final page folder only after all requested scales and `metadata.json` are complete. Failed partial captures may leave `.tmp/.../capture-errors.json` for debugging, but they should not update `pages.json`.
+During capture, page outputs are first staged under `.tmp/`. Move the staged folder into the final page folder only after all requested scales, reference validation, and `metadata.json` are complete. Failed partial captures may leave `.tmp/.../capture-errors.json` for debugging, but they should not update `pages.json`.
 
 Recommended downstream consumption:
 

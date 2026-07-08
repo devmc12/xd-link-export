@@ -19,7 +19,7 @@
 
 - 去掉 viewer chrome 和外部空白边缘
 - 默认导出原生 `artboard-1x.png`，可选导出 `artboard-2x.png`
-- 通过 XD specs zoom 和 SVG 画板 rect 几何，稳定导出长页面
+- 通过 XD specs zoom、SVG 画板 rect 几何和 XD thumbnail 参考校验，稳定导出长页面
 
 ### Metadata 导出
 
@@ -106,7 +106,7 @@ python scripts/export_xd_page_bundle.py `
 
 只有在 `--scales "1,2"` 或 `--scales "2,1"` 时才使用 `--parallel`，它会让 1x 和 2x 两个 scale worker 同时运行。
 
-截图流程使用 `domcontentloaded` 加 XD canvas、zoom、overlay 的就绪检查。`--wait-ms` 是最大 UI 就绪等待时间，不是每次导航后的固定 sleep。
+截图流程使用 `domcontentloaded` 加 XD canvas、zoom、overlay 的就绪检查。写入 PNG 前会把捕获到的画板和 XD 自带 thumbnail 参考图做低频视觉比对，避免把加载蒙版当成最终产物。`--wait-ms` 是最大 UI 就绪等待时间，不是每次导航后的固定 sleep。
 
 ## 输出
 
@@ -121,7 +121,7 @@ python scripts/export_xd_page_bundle.py `
       metadata.json
 ```
 
-页面产物会先写入 `.tmp/`，只有所有请求的 scale 都成功后才提交到正式页面目录。如果之前的页面目录是不完整的，下一次成功运行会修复这个稳定目录，不会额外生成时间戳重复目录；时间戳后缀只用于重复导出已经完整成功的页面。
+页面产物会先写入 `.tmp/`，只有所有请求的 scale 都成功并通过参考图校验后才提交到正式页面目录。如果之前的页面目录是不完整的，或者已有图像是过期加载态，下一次成功运行会修复这个稳定目录，不会额外生成时间戳重复目录；时间戳后缀只用于重复导出已经完整成功的页面。
 
 ## 相关文档
 

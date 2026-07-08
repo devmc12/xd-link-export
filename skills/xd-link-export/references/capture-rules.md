@@ -74,6 +74,8 @@ Reuse one browser context and one specs page per scale worker. Navigate that pag
 
 Wait for `domcontentloaded`, then wait for the visible canvas, zoom input, SVG overlay, and a nonzero artboard rect. Treat `--wait-ms` as the maximum readiness wait, not as a fixed post-navigation sleep.
 
+After geometry and native-pixel checks pass, compare a low-resolution artboard preview with XD's own thumbnail component from `window.prototypeData`. Retry while the preview differs too much from the thumbnail reference. This catches blank frames and loading masks, including cases where no spinner is visible. When reusing an existing page directory, validate the existing final PNG against the same reference before deciding whether to create a timestamped duplicate or repair the stable folder.
+
 ## Why Direct JS Canvas Export Fails
 
 The XD viewer render surface is commonly a WebGL canvas. Calling `canvas.toDataURL()` may return a black image. The reliable path is:
@@ -84,6 +86,7 @@ The XD viewer render surface is commonly a WebGL canvas. Calling `canvas.toDataU
 4. compare the projected canvas backing pixels against the requested output size
 5. hide the SVG overlay stroke
 6. capture the artboard rect from the browser surface
+7. validate the captured frame against the XD thumbnail reference before writing it as final output
 
 The default export should retain only the final requested scale images, written directly into the page folder root.
 

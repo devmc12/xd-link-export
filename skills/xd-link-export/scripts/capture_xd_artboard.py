@@ -7,11 +7,17 @@ import argparse
 import base64
 import json
 import math
+import struct
 import sys
+import urllib.request
+import zlib
 from pathlib import Path
 from typing import Any
 
 from playwright.sync_api import sync_playwright
+
+
+_REFERENCE_PNG_CACHE: dict[str, bytes] = {}
 
 
 def parse_args() -> argparse.Namespace:
@@ -24,6 +30,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wait-ms", type=int, default=15000, help="Maximum wait for XD UI after navigation")
     parser.add_argument("--post-zoom-wait-ms", type=int, default=200, help="Short settle wait after changing XD zoom")
     parser.add_argument("--scales", default="1", help='Native output scales: "1", "2", "1,2", or "2,1"')
+    parser.add_argument("--thumbnail-url", help="Optional XD thumbnail PNG URL for visual reference validation")
     parser.add_argument(
         "--metadata-file",
         help="Optional JSON file for standalone capture metadata",
@@ -83,6 +90,154 @@ def png_size(png_bytes: bytes) -> tuple[int, int]:
     return width, height
 
 
+def iter_png_chunks(png_bytes: bytes) -> Any:
+    # Yield PNG chunks for lightweight image comparison without Pillow.
+    if png_bytes[:8] != b"\x89PNG\r\n\x1a\n":
+        raise RuntimeError("Captured artboard is not a valid PNG image.")
+    pos = 8
+    while pos + 8 <= len(png_bytes):
+        length = int.from_bytes(png_bytes[pos : pos + 4], byteorder="big")
+        chunk_type = png_bytes[pos + 4 : pos + 8]
+        data_start = pos + 8
+        data_end = data_start + length
+        yield chunk_type, png_bytes[data_start:data_end]
+        pos = data_end + 4
+        if chunk_type == b"IEND":
+            break
+
+
+def paeth_predictor(a: int, b: int, c: int) -> int:
+    # Reconstruct PNG Paeth-filtered scanline bytes.
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def png_grayscale_fit(png_bytes: bytes, output_size: int = 96) -> dict[str, Any]:
+    # Decode a PNG and sample a center-cropped grayscale thumbnail.
+    width = height = bit_depth = color_type = None
+    idat_chunks = []
+    for chunk_type, chunk_data in iter_png_chunks(png_bytes):
+        if chunk_type == b"IHDR":
+            width, height, bit_depth, color_type = struct.unpack(">IIBB", chunk_data[:10])
+        elif chunk_type == b"IDAT":
+            idat_chunks.append(chunk_data)
+
+    if bit_depth != 8 or color_type not in {0, 2, 6}:
+        raise RuntimeError(f"Unsupported PNG format: bitDepth={bit_depth}, colorType={color_type}.")
+
+    bytes_per_pixel = {0: 1, 2: 3, 6: 4}[color_type]
+    scale = max(output_size / max(width, 1), output_size / max(height, 1))
+    crop_width = output_size / scale
+    crop_height = output_size / scale
+    crop_left = (width - crop_width) / 2
+    crop_top = (height - crop_height) / 2
+    x_map = [
+        min(width - 1, max(0, int(crop_left + (x + 0.5) / scale)))
+        for x in range(output_size)
+    ]
+    y_map = [
+        min(height - 1, max(0, int(crop_top + (y + 0.5) / scale)))
+        for y in range(output_size)
+    ]
+    wanted_rows: dict[int, list[int]] = {}
+    for output_y, source_y in enumerate(y_map):
+        wanted_rows.setdefault(source_y, []).append(output_y)
+
+    raw = zlib.decompress(b"".join(idat_chunks))
+    stride = width * bytes_per_pixel
+    previous = bytearray(stride)
+    offset = 0
+    pixels = [0] * (output_size * output_size)
+
+    for source_y in range(height):
+        filter_type = raw[offset]
+        offset += 1
+        scanline = bytearray(raw[offset : offset + stride])
+        offset += stride
+        for index in range(stride):
+            left = scanline[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            up = previous[index]
+            upper_left = previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            if filter_type == 1:
+                scanline[index] = (scanline[index] + left) & 0xFF
+            elif filter_type == 2:
+                scanline[index] = (scanline[index] + up) & 0xFF
+            elif filter_type == 3:
+                scanline[index] = (scanline[index] + ((left + up) // 2)) & 0xFF
+            elif filter_type == 4:
+                scanline[index] = (scanline[index] + paeth_predictor(left, up, upper_left)) & 0xFF
+            elif filter_type != 0:
+                raise RuntimeError(f"Unsupported PNG filter type: {filter_type}")
+
+        if source_y in wanted_rows:
+            for output_y in wanted_rows[source_y]:
+                row_start = output_y * output_size
+                for output_x, source_x in enumerate(x_map):
+                    base = source_x * bytes_per_pixel
+                    if color_type == 0:
+                        gray = scanline[base]
+                    else:
+                        r, g, b = scanline[base], scanline[base + 1], scanline[base + 2]
+                        if color_type == 6:
+                            alpha = scanline[base + 3]
+                            if alpha < 255:
+                                r = (r * alpha + 255 * (255 - alpha)) // 255
+                                g = (g * alpha + 255 * (255 - alpha)) // 255
+                                b = (b * alpha + 255 * (255 - alpha)) // 255
+                        gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+                    pixels[row_start + output_x] = gray
+        previous = scanline
+
+    return {
+        "sourceSize": {"width": width, "height": height},
+        "pixels": pixels,
+    }
+
+
+def thumbnail_mse(sample_png: bytes, reference_png: bytes, output_size: int = 96) -> dict[str, Any]:
+    # Compare two PNGs by their low-frequency center-cropped grayscale content.
+    sample = png_grayscale_fit(sample_png, output_size)
+    reference = png_grayscale_fit(reference_png, output_size)
+    sample_pixels = sample["pixels"]
+    reference_pixels = reference["pixels"]
+    mse = sum((a - b) ** 2 for a, b in zip(sample_pixels, reference_pixels)) / len(sample_pixels)
+    return {
+        "mse": round(mse, 2),
+        "sampleSize": sample["sourceSize"],
+        "referenceSize": reference["sourceSize"],
+        "sampleGrid": {"width": output_size, "height": output_size},
+    }
+
+
+def download_reference_png(thumbnail_url: str) -> bytes:
+    # Download and cache an XD thumbnail reference PNG.
+    cached = _REFERENCE_PNG_CACHE.get(thumbnail_url)
+    if cached is not None:
+        return cached
+    with urllib.request.urlopen(thumbnail_url, timeout=30) as response:
+        data = response.read()
+    png_size(data)
+    _REFERENCE_PNG_CACHE[thumbnail_url] = data
+    return data
+
+
+def validate_thumbnail_reference(sample_png: bytes, reference_png: bytes, threshold: float = 800.0) -> dict[str, Any]:
+    # Validate that a captured frame visually matches XD's thumbnail reference.
+    score = thumbnail_mse(sample_png, reference_png)
+    return {
+        **score,
+        "threshold": threshold,
+        "pass": score["mse"] <= threshold,
+    }
+
+
 def build_candidate_viewports(design_width: int, design_height: int, scale_value: int) -> list[dict[str, int]]:
     # Build orientation-aware viewport candidates for the requested XD zoom scale.
     target_width = design_width * scale_value
@@ -122,6 +277,23 @@ def wait_for_capture_ui(page: Any, wait_ms: int) -> None:
         }""",
         timeout=timeout_ms,
     )
+
+
+def goto_xd_capture_page(page: Any, capture_url: str, wait_ms: int, attempts: int = 3) -> None:
+    # Navigate to an XD specs page with retries for transient network failures.
+    timeout_ms = max(wait_ms + 5000, 20000)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            page.goto(capture_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            page.wait_for_timeout(1000 * attempt)
+    if last_error is not None:
+        raise last_error
 
 
 def set_xd_zoom(page: Any, scale_value: int, design_width: int, wait_ms: int) -> None:
@@ -330,8 +502,8 @@ def is_rect_inside_canvas(rect_candidate: dict[str, Any], canvas: dict[str, Any]
     )
 
 
-def capture_artboard_png(page: Any, rect_candidate: dict[str, Any], target_width: int, target_height: int) -> bytes:
-    # Capture only the artboard display rect and hide XD's overlay stroke first.
+def capture_clipped_png(page: Any, clip: dict[str, float]) -> bytes:
+    # Capture a browser-surface clip and hide XD's overlay stroke first.
     page.evaluate(
         """
         () => {
@@ -343,21 +515,12 @@ def capture_artboard_png(page: Any, rect_candidate: dict[str, Any], target_width
     )
     try:
         page.wait_for_timeout(100)
-
-        rect = rect_candidate["rect"]
-        scale = target_width / max(rect["width"], 1)
         cdp = page.context.new_cdp_session(page)
         shot = cdp.send(
             "Page.captureScreenshot",
             {
                 "format": "png",
-                "clip": {
-                    "x": rect["left"],
-                    "y": rect["top"],
-                    "width": rect["width"],
-                    "height": rect["height"],
-                    "scale": scale,
-                },
+                "clip": clip,
                 "captureBeyondViewport": True,
                 "fromSurface": True,
             },
@@ -373,7 +536,39 @@ def capture_artboard_png(page: Any, rect_candidate: dict[str, Any], target_width
             """
         )
 
-    png_bytes = base64.b64decode(shot["data"])
+    return base64.b64decode(shot["data"])
+
+
+def capture_artboard_preview_png(page: Any, rect_candidate: dict[str, Any]) -> bytes:
+    # Capture a low-resolution full-artboard preview for reference validation.
+    rect = rect_candidate["rect"]
+    preview_scale = min(1.0, 480 / max(rect["width"], 1))
+    return capture_clipped_png(
+        page,
+        {
+            "x": rect["left"],
+            "y": rect["top"],
+            "width": rect["width"],
+            "height": rect["height"],
+            "scale": preview_scale,
+        },
+    )
+
+
+def capture_artboard_png(page: Any, rect_candidate: dict[str, Any], target_width: int, target_height: int) -> bytes:
+    # Capture only the artboard display rect at the requested native output size.
+    rect = rect_candidate["rect"]
+    scale = target_width / max(rect["width"], 1)
+    png_bytes = capture_clipped_png(
+        page,
+        {
+            "x": rect["left"],
+            "y": rect["top"],
+            "width": rect["width"],
+            "height": rect["height"],
+            "scale": scale,
+        },
+    )
     actual_width, actual_height = png_size(png_bytes)
     if (actual_width, actual_height) != (target_width, target_height):
         raise RuntimeError(
@@ -390,11 +585,13 @@ def capture_scale_on_page(
     design_height: int,
     scale_value: int,
     post_zoom_wait_ms: int,
+    thumbnail_url: str | None = None,
 ) -> dict[str, Any]:
     # Export one native-scale artboard PNG on an already-loaded XD specs page.
     target_width = design_width * scale_value
     target_height = design_height * scale_value
     attempts: list[dict[str, Any]] = []
+    reference_png = download_reference_png(thumbnail_url) if thumbnail_url else None
 
     for viewport in build_candidate_viewports(design_width, design_height, scale_value):
         try:
@@ -432,18 +629,32 @@ def capture_scale_on_page(
             if not pass_native:
                 continue
 
-            png_bytes = capture_artboard_png(page, selected_rect, target_width, target_height)
-            output_path.write_bytes(png_bytes)
-            return {
-                "zoomValue": f"{scale_value * 100}%",
-                "viewport": viewport,
-                "canvas": canvas,
-                "selectedRect": selected_rect,
-                "projectedRaw": raw_size,
-                "targetSize": {"width": target_width, "height": target_height},
-                "outputSize": {"width": target_width, "height": target_height},
-                "attempts": attempts,
-            }
+            for visual_attempt in range(1, 8 if reference_png else 2):
+                visual_record = {**attempt, "visualAttempt": visual_attempt}
+                if reference_png:
+                    preview_png = capture_artboard_preview_png(page, selected_rect)
+                    preview_validation = validate_thumbnail_reference(preview_png, reference_png)
+                    visual_record["previewReferenceValidation"] = preview_validation
+                    if not preview_validation["pass"]:
+                        attempts.append(visual_record)
+                        page.wait_for_timeout(750)
+                        continue
+
+                png_bytes = capture_artboard_png(page, selected_rect, target_width, target_height)
+                attempts.append(visual_record)
+
+                output_path.write_bytes(png_bytes)
+                return {
+                    "zoomValue": f"{scale_value * 100}%",
+                    "viewport": viewport,
+                    "canvas": canvas,
+                    "selectedRect": selected_rect,
+                    "projectedRaw": raw_size,
+                    "targetSize": {"width": target_width, "height": target_height},
+                    "outputSize": {"width": target_width, "height": target_height},
+                    "referenceValidation": visual_record.get("previewReferenceValidation"),
+                    "attempts": attempts,
+                }
         except Exception as exc:
             attempts.append(
                 {
@@ -465,13 +676,14 @@ def capture_scale_output(
     scale_value: int,
     wait_ms: int,
     post_zoom_wait_ms: int,
+    thumbnail_url: str | None = None,
 ) -> dict[str, Any]:
     # Export one native-scale artboard PNG through XD zoom and overlay rect geometry.
     initial_viewport = build_candidate_viewports(design_width, design_height, scale_value)[0]
     context = browser.new_context(viewport=initial_viewport, device_scale_factor=1)
     page = context.new_page()
     try:
-        page.goto(capture_url, wait_until="domcontentloaded", timeout=max(wait_ms + 5000, 20000))
+        goto_xd_capture_page(page, capture_url, wait_ms)
         wait_for_capture_ui(page, wait_ms)
         return capture_scale_on_page(
             page=page,
@@ -480,6 +692,7 @@ def capture_scale_output(
             design_height=design_height,
             scale_value=scale_value,
             post_zoom_wait_ms=post_zoom_wait_ms,
+            thumbnail_url=thumbnail_url,
         )
     finally:
         page.close()
@@ -495,6 +708,7 @@ def capture_artboard_scales(
     scale_values: list[int],
     wait_ms: int,
     post_zoom_wait_ms: int,
+    thumbnail_url: str | None = None,
 ) -> dict[str, Any]:
     # Capture each requested native artboard scale in an isolated XD specs page.
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -514,11 +728,12 @@ def capture_artboard_scales(
             scale_value=scale_value,
             wait_ms=wait_ms,
             post_zoom_wait_ms=post_zoom_wait_ms,
+            thumbnail_url=thumbnail_url,
         )
         files[scale_key] = str(output_path)
 
     return {
-        "strategy": "xd-zoom-svg-rect",
+        "strategy": "xd-zoom-svg-rect-thumbnail-reference" if thumbnail_url else "xd-zoom-svg-rect",
         "files": files,
         "scales": scales,
     }
@@ -546,6 +761,7 @@ def main() -> int:
                 scale_values=scale_values,
                 wait_ms=args.wait_ms,
                 post_zoom_wait_ms=args.post_zoom_wait_ms,
+                thumbnail_url=args.thumbnail_url,
             )
         finally:
             browser.close()
