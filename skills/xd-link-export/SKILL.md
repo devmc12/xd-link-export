@@ -1,6 +1,6 @@
 ---
 name: xd-link-export
-description: Export reusable page bundles from Adobe XD share links, especially `xd.adobe.com/view/SHARE_ID/screen/SCREEN_ID/`, `.../screen/SCREEN_ID/specs/`, `.../screen/SCREEN_ID/variables/`, and `.../grid` routes. Use when Codex needs to capture all pages or selected page ranges as clean native 1x/2x artboard images through XD specs zoom and XD thumbnail reference validation, collect page-level source and capture metadata, remove viewer chrome and outer blank areas, preserve long mobile screens, and write the results under `.xd-export/` inside the current project.
+description: Export all or selected pages from Adobe XD share links as reusable 1x/2x images and metadata for frontend implementation.
 ---
 
 # XD Link Export
